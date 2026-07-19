@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v36';
+const APP_VERSION = 'v37';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1308,5 +1308,8 @@ async function forceUpdate() {
       await Promise.all(keys.map((k) => caches.delete(k)));
     }
   } catch (_) {}
-  location.reload();
+  // 用帶時間戳的網址重新載入，強制繞過 iOS 的 HTTP 快取（GitHub Pages 有 10 分鐘快取）
+  const u = new URL(location.href);
+  u.searchParams.set('fresh', String(Date.now()));
+  location.replace(u.toString());
 }

@@ -1,6 +1,6 @@
 // Service Worker：快取 App 靜態殼，離線可開啟並瀏覽已存記錄。
 // Gemini API 一律走網路（不快取）。
-const CACHE = 'meeting-app-v36';
+const CACHE = 'meeting-app-v37';
 const ASSETS = [
   './',
   './index.html',
@@ -27,7 +27,8 @@ self.addEventListener('install', (e) => {
   e.waitUntil(
     caches
       .open(CACHE)
-      .then((c) => c.addAll(ASSETS))
+      // no-cache：安裝時一律向伺服器驗證，不吃瀏覽器 HTTP 快取裡的舊檔
+      .then((c) => c.addAll(ASSETS.map((a) => new Request(a, { cache: 'no-cache' }))))
       .then(() => self.skipWaiting())
   );
 });
@@ -48,7 +49,8 @@ self.addEventListener('fetch', (e) => {
   if (url.origin !== location.origin) return; // Gemini API 等外部一律走網路
   if (e.request.method !== 'GET') return;
   e.respondWith(
-    fetch(e.request)
+    // no-cache：每次都帶 ETag 向伺服器驗證（沒變回 304 很省），確保拿到最新版程式碼
+    fetch(e.request, { cache: 'no-cache' })
       .then((res) => {
         const copy = res.clone();
         caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});
