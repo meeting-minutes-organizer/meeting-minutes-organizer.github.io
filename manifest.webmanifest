@@ -1,6 +1,6 @@
 {
-  "name": "會議記錄",
-  "short_name": "會議記錄",
+  "name": "DD會議紀錄",
+  "short_name": "DD會議紀錄",
   "start_url": "./",
   "scope": "./",
   "display": "standalone",

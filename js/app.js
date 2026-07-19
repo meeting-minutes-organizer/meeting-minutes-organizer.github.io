@@ -9,7 +9,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v26';
+const APP_VERSION = 'v27';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -105,7 +105,7 @@ async function syncNow(silent) {
 
 async function renderList() {
   const meetings = await list();
-  setHeader('會議記錄', false, meetings.length > 0);
+  setHeader('DD會議紀錄', false, meetings.length > 0);
   if (!meetings.length) {
     view.innerHTML = `<div class="empty">還沒有會議記錄<br>點下方「＋ 新增會議」上傳錄音檔</div>`;
     return;
