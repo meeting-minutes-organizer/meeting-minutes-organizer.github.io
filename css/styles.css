@@ -103,6 +103,9 @@ button.copy { background: var(--bg); color: var(--ink); border: 1px solid var(--
 .spk-chip:active { transform: scale(0.96); }
 .btn-regen { width: 100%; margin-top: 14px; padding: 11px; border: 1px solid var(--line); border-radius: 10px; background: var(--btn2); color: var(--ink); font-size: 14px; font-weight: 600; }
 .btn-regen:active { transform: scale(0.99); }
+.lang-toggle { display: flex; gap: 6px; margin-top: 12px; }
+.lang-toggle button { flex: 1; padding: 8px 6px; border: 1px solid var(--line); border-radius: 9px; background: var(--card); color: var(--ink); font-size: 14px; font-weight: 600; }
+.lang-toggle button.active { background: var(--brand); color: #fff; border-color: var(--brand); }
 .export-row { display: flex; gap: 8px; margin-top: 12px; }
 .btn-export { flex: 1; padding: 11px 8px; border: 1px solid var(--brand); border-radius: 10px; background: transparent; color: var(--brand); font-size: 14px; font-weight: 600; }
 .btn-export:active { background: var(--brand); color: #fff; }

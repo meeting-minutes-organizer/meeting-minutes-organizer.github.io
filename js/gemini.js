@@ -397,3 +397,72 @@ export async function regenerateSummary(segments, apiKeys, opts = {}) {
   const model = await resolveModel(kos[0].key);
   return summarizeSegments(segments, kos, model, onProgress);
 }
+
+// ---- 翻譯（純文字，很省；一次翻逐字稿+摘要）----
+const LANG_LABEL = { en: 'English', ja: '日本語 (Japanese)' };
+const TRANSLATE_SCHEMA = {
+  type: 'object',
+  properties: {
+    segments: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { speaker: { type: 'string' }, text: { type: 'string' } },
+        required: ['speaker', 'text'],
+      },
+    },
+    actionItems: { type: 'array', items: { type: 'string' } },
+    mainPoints: { type: 'array', items: { type: 'string' } },
+    qa: { type: 'array', items: { type: 'string' } },
+  },
+  required: ['segments', 'actionItems', 'mainPoints', 'qa'],
+};
+
+export async function translateMeeting(transcript, summary, targetLang, apiKeys, opts = {}) {
+  const onProgress = opts.onProgress;
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+  const label = LANG_LABEL[targetLang] || targetLang;
+  report(onProgress, 'model', 3, '選擇型號中…');
+  const model = await resolveModel(kos[0].key);
+  const payload = {
+    segments: transcript || [],
+    actionItems: (summary && summary.actionItems) || [],
+    mainPoints: (summary && (summary.mainPoints || summary.keyPoints)) || [],
+    qa: (summary && summary.qa) || [],
+  };
+  const prompt =
+    `You are a professional meeting-notes translator. Translate ALL text values in the following meeting JSON into ${label}. ` +
+    `Also translate the speaker labels (e.g. "說話者1" → an appropriate label such as "Speaker 1" / "話者1"). ` +
+    `Keep the EXACT same JSON structure, the same array lengths and the same order — translate the values only, do NOT add, remove, merge or reorder items. ` +
+    `In actionItems, keep the "[DRI: ...]" tag format. In qa keep the "問：/答：" style but in ${label} (e.g. "Q:/A:"). Output JSON only.\n\n` +
+    JSON.stringify(payload);
+  const variants = kos.map((k) => ({ key: k.key, name: k.name }));
+  const res = await postJsonRotating(
+    variants,
+    (v) => ({
+      url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: TRANSLATE_SCHEMA,
+          maxOutputTokens: 65535,
+          thinkingConfig: { thinkingBudget: 0 },
+        },
+      }),
+    }),
+    onProgress,
+    `翻譯成 ${label} 中…`
+  );
+  const data = await res.json();
+  const out =
+    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
+    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if (!out) throw new Error('未取得翻譯結果，請重試。');
+  const r = JSON.parse(out);
+  return {
+    transcript: r.segments || [],
+    summary: { actionItems: r.actionItems || [], mainPoints: r.mainPoints || [], qa: r.qa || [] },
+  };
+}

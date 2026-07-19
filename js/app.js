@@ -9,7 +9,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v27';
+const APP_VERSION = 'v28';
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -517,11 +517,8 @@ async function renderDetail(id) {
     return;
   }
   setHeader('會議詳情', true);
-  const s = m.summary || {};
-  // 向後相容舊記錄（keyPoints/decisions）
-  const actionItems = s.actionItems || [];
-  const mainPoints = s.mainPoints || s.keyPoints || [];
-  const qa = s.qa || [];
+  let lang = 'zh';
+
   const olHtml = (arr) =>
     arr && arr.length
       ? `<ol class="list">${arr.map((x) => `<li>${esc(x)}</li>`).join('')}</ol>`
@@ -535,69 +532,116 @@ async function renderDetail(id) {
           })
           .join('')}</ol>`
       : `<div class="meta" style="padding-left:4px">無</div>`;
+  const numbered = (arr) => (arr || []).map((x, i) => `${i + 1}. ${x}`).join('\n');
+  const qaText = (arr) =>
+    arr && arr.length
+      ? arr.map((x, i) => { const { q, a } = splitQA(x); return `${i + 1}. 問：${q}\n   答：${a}`; }).join('\n')
+      : '無';
 
-  const colors = speakerColors(m.transcript);
-  const segHtml = (m.transcript || [])
-    .map((s) => `<div class="seg"><span class="spk" style="color:${colors[s.speaker] || 'var(--ink)'}">${esc(s.speaker)}</span>${esc(s.text)}</div>`)
-    .join('');
-
-  const speakers = Object.keys(colors);
-  const chipsHtml = speakers.length
-    ? `<div class="spk-rename">${speakers
-        .map((sp) => `<button class="spk-chip" data-spk="${esc(sp)}" style="color:${colors[sp]};border-color:${colors[sp]}">✎ ${esc(sp)}</button>`)
-        .join('')}</div>`
-    : '';
+  const contentFor = (l) => {
+    if (l === 'zh') return { transcript: m.transcript || [], summary: m.summary || {} };
+    const t = m.translations && m.translations[l];
+    return t ? { transcript: t.transcript || [], summary: t.summary || {} } : null;
+  };
+  const viewMeeting = () => {
+    const c = contentFor(lang) || contentFor('zh');
+    return Object.assign({}, m, { transcript: c.transcript, summary: c.summary });
+  };
 
   view.innerHTML = `
     <div class="card">
       <input type="text" id="titleInput" value="${esc(m.title)}" />
       <div class="meta" style="margin-top:8px">${formatDate(m.createdAt)}</div>
+      <div class="lang-toggle" id="langToggle">
+        <button data-l="zh" class="active">中文</button>
+        <button data-l="en">English</button>
+        <button data-l="ja">日本語</button>
+      </div>
       <button class="big" id="shareBtn" style="margin-top:12px">📤 分享待辦與重點</button>
       <div class="export-row">
         <button class="btn-export" id="pdfBtn">📄 匯出 PDF</button>
         <button class="btn-export" id="wordBtn">📝 匯出 Word (docx)</button>
       </div>
     </div>
-    <div class="card">
-      <div class="section-title" style="margin-top:0">✅ 待辦事項 Action Item <button class="copy" data-copy="ai">複製</button></div>
-      ${olHtml(actionItems)}
-      <div class="section-title">📌 會議重點 Main Point <button class="copy" data-copy="mp">複製</button></div>
-      ${olHtml(mainPoints)}
-      <div class="section-title">❓ 會議提問 Q&amp;A <button class="copy" data-copy="qa">複製</button></div>
-      ${qaHtml(qa)}
-      <button class="btn-regen" id="regenBtn">🔄 重新整理摘要（用逐字稿重跑，不需重傳音檔）</button>
-    </div>
-    <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
-    ${chipsHtml ? `<div class="hint" style="margin:0 4px 6px">點下方語者可改名（例如「說話者1」→「陳經理」）</div>${chipsHtml}` : ''}
-    <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>
+    <div id="detailBody"></div>
     <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
 
-  document.getElementById('pdfBtn').onclick = () => exportPdf(m);
-  document.getElementById('wordBtn').onclick = () => exportWord(m);
+  const bodyEl = document.getElementById('detailBody');
 
-  // 分享（待辦 + 重點）
-  document.getElementById('shareBtn').onclick = async () => {
-    const num = (arr) => (arr || []).map((x, i) => `${i + 1}. ${x}`).join('\n');
-    const text =
-      `【${m.title}】\n${formatDate(m.createdAt)}\n\n` +
-      `■ 待辦事項\n${num(actionItems) || '（無）'}\n\n` +
-      `■ 會議重點\n${num(mainPoints) || '（無）'}`;
-    if (navigator.share) {
-      try {
-        await navigator.share({ title: m.title, text });
-      } catch (_) {}
-    } else {
-      try {
-        await navigator.clipboard.writeText(text);
-        toast('已複製到剪貼簿，可貼給同事');
-      } catch (_) {
-        alert(text);
-      }
+  const drawBody = (l) => {
+    const c = contentFor(l);
+    if (!c) {
+      bodyEl.innerHTML = `<div class="card"><div class="progress"><div class="spinner"></div><div id="tprogmsg">翻譯中…</div></div></div>`;
+      return;
+    }
+    const s = c.summary || {};
+    const actionItems = s.actionItems || [];
+    const mainPoints = s.mainPoints || s.keyPoints || [];
+    const qa = s.qa || [];
+    const colors = speakerColors(c.transcript);
+    const segHtml = (c.transcript || [])
+      .map((seg) => `<div class="seg"><span class="spk" style="color:${colors[seg.speaker] || 'var(--ink)'}">${esc(seg.speaker)}</span>${esc(seg.text)}</div>`)
+      .join('');
+    const isZh = l === 'zh';
+    const speakers = Object.keys(colors);
+    const chipsHtml =
+      isZh && speakers.length
+        ? `<div class="spk-rename">${speakers
+            .map((sp) => `<button class="spk-chip" data-spk="${esc(sp)}" style="color:${colors[sp]};border-color:${colors[sp]}">✎ ${esc(sp)}</button>`)
+            .join('')}</div>`
+        : '';
+    bodyEl.innerHTML = `
+      <div class="card">
+        <div class="section-title" style="margin-top:0">✅ 待辦事項 Action Item <button class="copy" data-copy="ai">複製</button></div>
+        ${olHtml(actionItems)}
+        <div class="section-title">📌 會議重點 Main Point <button class="copy" data-copy="mp">複製</button></div>
+        ${olHtml(mainPoints)}
+        <div class="section-title">❓ 會議提問 Q&amp;A <button class="copy" data-copy="qa">複製</button></div>
+        ${qaHtml(qa)}
+        ${isZh ? '<button class="btn-regen" id="regenBtn">🔄 重新整理摘要（用逐字稿重跑，不需重傳音檔）</button>' : ''}
+      </div>
+      <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
+      ${chipsHtml ? `<div class="hint" style="margin:0 4px 6px">點下方語者可改名（例如「說話者1」→「陳經理」）</div>${chipsHtml}` : ''}
+      <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>`;
+
+    const texts = { ai: numbered(actionItems), mp: numbered(mainPoints), qa: qaText(qa), tr: transcriptToText(c.transcript) };
+    bodyEl.querySelectorAll('.copy').forEach((b) => {
+      b.onclick = async () => {
+        try {
+          await navigator.clipboard.writeText(texts[b.dataset.copy] || '');
+          const old = b.textContent;
+          b.textContent = '已複製';
+          setTimeout(() => (b.textContent = old), 1200);
+        } catch (_) {
+          alert('複製失敗，請手動選取');
+        }
+      };
+    });
+
+    if (isZh) {
+      const rb = document.getElementById('regenBtn');
+      if (rb) rb.onclick = doRegen;
+      bodyEl.querySelectorAll('.spk-chip').forEach((chip) => {
+        chip.onclick = async () => {
+          const cur = chip.dataset.spk;
+          const nn = prompt(`把「${cur}」改成：`, cur);
+          if (nn && nn.trim() && nn.trim() !== cur) {
+            const name = nn.trim();
+            m.transcript.forEach((seg) => {
+              if (seg.speaker === cur) seg.speaker = name;
+            });
+            m.translations = {}; // 原文改了，清掉舊翻譯
+            m.updatedAt = Date.now();
+            await save(m);
+            syncNow();
+            renderDetail(id);
+          }
+        };
+      });
     }
   };
 
-  // 重新整理摘要（用既有逐字稿）
-  document.getElementById('regenBtn').onclick = async () => {
+  async function doRegen() {
     if (!hasApiKey()) {
       alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
       return;
@@ -615,6 +659,7 @@ async function renderDetail(id) {
         onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '處理中…')),
       });
       m.summary = summary;
+      m.translations = {}; // 摘要改了，清掉舊翻譯
       m.updatedAt = Date.now();
       await save(m);
       syncNow();
@@ -625,25 +670,66 @@ async function renderDetail(id) {
       btn.disabled = false;
       btn.textContent = old;
     }
-  };
+  }
 
-  // 語者改名
-  view.querySelectorAll('.spk-chip').forEach((chip) => {
-    chip.onclick = async () => {
-      const cur = chip.dataset.spk;
-      const nn = prompt(`把「${cur}」改成：`, cur);
-      if (nn && nn.trim() && nn.trim() !== cur) {
-        const name = nn.trim();
-        m.transcript.forEach((seg) => {
-          if (seg.speaker === cur) seg.speaker = name;
+  const setLang = async (l) => {
+    document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === l));
+    if (l !== 'zh' && !contentFor(l)) {
+      if (!hasApiKey()) {
+        alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
+        document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === 'zh'));
+        return;
+      }
+      lang = l;
+      drawBody(l); // 顯示「翻譯中…」
+      try {
+        const tr = await translateMeeting(m.transcript, m.summary, l, getApiKeyEntries(), {
+          onProgress: (info) => {
+            const el = document.getElementById('tprogmsg');
+            if (el && info && info.message) el.textContent = info.message;
+          },
         });
+        m.translations = m.translations || {};
+        m.translations[l] = tr;
         m.updatedAt = Date.now();
         await save(m);
         syncNow();
-        renderDetail(id);
+        if (lang === l) drawBody(l);
+      } catch (e) {
+        alert('翻譯失敗：' + (e && e.message ? e.message : e));
+        lang = 'zh';
+        setLang('zh');
       }
-    };
-  });
+    } else {
+      lang = l;
+      drawBody(l);
+    }
+  };
+  document.querySelectorAll('#langToggle button').forEach((b) => (b.onclick = () => setLang(b.dataset.l)));
+
+  document.getElementById('pdfBtn').onclick = () => exportPdf(viewMeeting());
+  document.getElementById('wordBtn').onclick = () => exportWord(viewMeeting());
+  document.getElementById('shareBtn').onclick = async () => {
+    const v = viewMeeting();
+    const s = v.summary || {};
+    const num = (arr) => (arr || []).map((x, i) => `${i + 1}. ${x}`).join('\n');
+    const text =
+      `【${v.title}】\n${formatDate(v.createdAt)}\n\n` +
+      `■ 待辦事項\n${num(s.actionItems) || '（無）'}\n\n` +
+      `■ 會議重點\n${num(s.mainPoints || s.keyPoints) || '（無）'}`;
+    if (navigator.share) {
+      try {
+        await navigator.share({ title: v.title, text });
+      } catch (_) {}
+    } else {
+      try {
+        await navigator.clipboard.writeText(text);
+        toast('已複製到剪貼簿，可貼給同事');
+      } catch (_) {
+        alert(text);
+      }
+    }
+  };
 
   document.getElementById('titleInput').onchange = async (e) => {
     m.title = e.target.value.trim() || m.title;
@@ -651,34 +737,6 @@ async function renderDetail(id) {
     await save(m);
     syncNow();
   };
-  const numbered = (arr) => (arr || []).map((x, i) => `${i + 1}. ${x}`).join('\n');
-  const qaText = (arr) =>
-    arr && arr.length
-      ? arr
-          .map((x, i) => {
-            const { q, a } = splitQA(x);
-            return `${i + 1}. 問：${q}\n   答：${a}`;
-          })
-          .join('\n')
-      : '無';
-  const texts = {
-    ai: numbered(actionItems),
-    mp: numbered(mainPoints),
-    qa: qaText(qa),
-    tr: transcriptToText(m.transcript),
-  };
-  view.querySelectorAll('.copy').forEach((b) => {
-    b.onclick = async () => {
-      try {
-        await navigator.clipboard.writeText(texts[b.dataset.copy] || '');
-        const old = b.textContent;
-        b.textContent = '已複製';
-        setTimeout(() => (b.textContent = old), 1200);
-      } catch (_) {
-        alert('複製失敗，請手動選取');
-      }
-    };
-  });
   document.getElementById('del').onclick = async () => {
     if (confirm('確定刪除這場會議記錄？此動作無法復原。')) {
       await remove(id);
@@ -686,6 +744,8 @@ async function renderDetail(id) {
       syncNow();
     }
   };
+
+  drawBody('zh');
 }
 
 function renderSettings() {
