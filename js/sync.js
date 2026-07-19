@@ -67,10 +67,29 @@ function mergeMeeting(a, b) {
   return merged;
 }
 
-export function mergeState(a, b) {
+const TOMB_TTL = 180 * 24 * 3600 * 1000; // 墓碑保留 180 天後可清理（避免無限膨脹）
+
+// 合併兩邊的刪除時間表，並清掉「有時間戳且超過 TTL」的墓碑。
+// 沒有時間戳的舊墓碑一律保留（保守，不會誤讓已刪的資料復活）。
+function mergeTombstones(idsA, idsB, timesA, timesB, now) {
+  const times = { ...(timesA || {}), ...(timesB || {}) };
+  const all = new Set([...(idsA || []), ...(idsB || [])]);
+  const kept = [];
+  const keptTimes = {};
+  for (const id of all) {
+    const t = times[id];
+    if (t && now - t > TOMB_TTL) continue; // 過期 → 清掉
+    kept.push(id);
+    if (t) keptTimes[id] = t;
+  }
+  return { ids: kept, times: keptTimes };
+}
+
+export function mergeState(a, b, now = Date.now()) {
   const A = a || { meetings: [], deleted: [] };
   const B = b || { meetings: [], deleted: [] };
-  const deleted = Array.from(new Set([...(A.deleted || []), ...(B.deleted || [])]));
+  const tomb = mergeTombstones(A.deleted, B.deleted, A.deletedAt, B.deletedAt, now);
+  const deleted = tomb.ids;
   const delSet = new Set(deleted);
   const byId = new Map();
   for (const m of [...(A.meetings || []), ...(B.meetings || [])]) {
@@ -79,7 +98,8 @@ export function mergeState(a, b) {
   }
   const meetings = Array.from(byId.values()).sort((x, y) => y.createdAt - x.createdAt);
   // 分類群組合併（墓碑 + editStamp 較新者勝 + id 白名單）
-  const groupsDeleted = Array.from(new Set([...(A.groupsDeleted || []), ...(B.groupsDeleted || [])]));
+  const gTomb = mergeTombstones(A.groupsDeleted, B.groupsDeleted, A.groupsDeletedAt, B.groupsDeletedAt, now);
+  const groupsDeleted = gTomb.ids;
   const gDelSet = new Set(groupsDeleted);
   const gById = new Map();
   for (const g of [...(A.groups || []), ...(B.groups || [])]) {
@@ -88,7 +108,7 @@ export function mergeState(a, b) {
     if (!prev || editStamp(g) >= editStamp(prev)) gById.set(g.id, g);
   }
   const groups = Array.from(gById.values()).sort((x, y) => (x.createdAt || 0) - (y.createdAt || 0));
-  return { meetings, deleted, groups, groupsDeleted };
+  return { meetings, deleted, deletedAt: tomb.times, groups, groupsDeleted, groupsDeletedAt: gTomb.times };
 }
 
 // ---- UTF-8 安全的 base64（處理中文與大檔）----
@@ -124,7 +144,7 @@ export async function pull() {
   const c = getSyncConfig();
   if (!c) throw new Error('尚未設定雲端同步');
   const res = await fetch(apiUrl(c), { headers: authHeaders(c) });
-  if (res.status === 404) return { doc: { meetings: [], deleted: [], groups: [], groupsDeleted: [] }, sha: null };
+  if (res.status === 404) return { doc: { meetings: [], deleted: [], deletedAt: {}, groups: [], groupsDeleted: [], groupsDeletedAt: {} }, sha: null };
   if (res.status === 401) throw new Error('GitHub 權杖無效或已過期');
   if (!res.ok) throw new Error(`雲端讀取失敗 (${res.status})`);
   const data = await res.json();
@@ -156,9 +176,26 @@ export async function pull() {
   }
   doc.meetings = doc.meetings || [];
   doc.deleted = doc.deleted || [];
+  doc.deletedAt = doc.deletedAt || {};
   doc.groups = doc.groups || [];
   doc.groupsDeleted = doc.groupsDeleted || [];
+  doc.groupsDeletedAt = doc.groupsDeletedAt || {};
   return { doc, sha: data.sha };
+}
+
+// 上雲前把「翻譯」拿掉：翻譯是衍生資料（各裝置可自行重翻），且通常占整份體積一半以上。
+// 不上雲 → 雲端檔案大幅變小、更慢碰到 GitHub 1MB 界線，也減少多裝置合併衝突。
+// （本機 IndexedDB 仍保留完整翻譯，這裡只影響推到 GitHub 的內容。）
+export function stripForCloud(doc) {
+  return {
+    ...doc,
+    meetings: (doc.meetings || []).map((m) => {
+      if (!m || !m.translations) return m;
+      const copy = { ...m };
+      delete copy.translations;
+      return copy;
+    }),
+  };
 }
 
 export async function push(doc, sha) {
@@ -166,7 +203,7 @@ export async function push(doc, sha) {
   if (!c) throw new Error('尚未設定雲端同步');
   const body = {
     message: `update meetings (${new Date().toISOString()})`,
-    content: b64encodeUtf8(JSON.stringify(doc, null, 2)),
+    content: b64encodeUtf8(JSON.stringify(stripForCloud(doc), null, 2)),
   };
   if (sha) body.sha = sha;
   const res = await fetch(apiUrl(c), { method: 'PUT', headers: authHeaders(c), body: JSON.stringify(body) });

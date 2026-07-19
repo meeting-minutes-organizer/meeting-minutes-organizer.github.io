@@ -70,6 +70,9 @@ export async function remove(id) {
     t.push(id);
     setTombstones(t);
   }
+  const times = getTombstoneTimes();
+  times[id] = Date.now(); // 記錄刪除時間，供合併時清理過期墓碑
+  setTombstoneTimes(times);
 }
 
 // 備份匯出：包含會議、刪除墓碑、分類群組（讓沒開雲端同步的人也能完整還原）
@@ -80,8 +83,10 @@ export async function exportAll(extra = {}) {
       exportedAt: Date.now(),
       meetings,
       deleted: getTombstones(),
+      deletedAt: getTombstoneTimes(),
       groups: extra.groups || [],
       groupsDeleted: extra.groupsDeleted || [],
+      groupsDeletedAt: extra.groupsDeletedAt || {},
     },
     null,
     2
@@ -100,6 +105,17 @@ export function getTombstones() {
 export function setTombstones(ids) {
   localStorage.setItem(TOMB_KEY, JSON.stringify(Array.from(new Set(ids || []))));
 }
+const TOMB_TIME_KEY = 'meeting_tombstone_times';
+export function getTombstoneTimes() {
+  try {
+    return JSON.parse(localStorage.getItem(TOMB_TIME_KEY)) || {};
+  } catch (_) {
+    return {};
+  }
+}
+export function setTombstoneTimes(map) {
+  localStorage.setItem(TOMB_TIME_KEY, JSON.stringify(map || {}));
+}
 
 // 把雲端合併後的文件套用到本機：刪掉墓碑內的、寫入所有會議、更新墓碑。
 export async function applyMerged(doc) {
@@ -113,4 +129,5 @@ export async function applyMerged(doc) {
     if (!delSet.has(m.id)) await run('readwrite', (os) => os.put(m));
   }
   setTombstones(deleted);
+  if (doc.deletedAt) setTombstoneTimes(doc.deletedAt);
 }

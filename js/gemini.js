@@ -173,6 +173,8 @@ export function parseRetryDelayMs(bodyText) {
 // - 某變體 429/5xx/網路錯 → 立刻換下一個變體重試（多把金鑰各有各的每分鐘額度、各自的檔案）
 // - 全部受限 → 依 Google 建議秒數等待後再整輪重試
 async function postJsonRotating(variants, makeReq, onProgress, label) {
+  // 錯誤訊息用當前動作命名（摘要/翻譯/問答/加強/辨識），不再一律寫「辨識失敗」誤導
+  const act = (label || '處理').replace(/[…\.]+$/, '').replace(/中$/, '') || '處理';
   const vs = variants && variants.length ? variants : [{}];
   const MAX_ROUNDS = 4;
   const MAX_TOTAL_WAIT = 150000; // 累計等待超過 ~2.5 分鐘就放棄（避免無限迴圈）
@@ -211,7 +213,7 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
         sawTransient = true;
         continue;
       }
-      throw new Error(`辨識失敗 (${res.status})：${lastText.slice(0, 300)}`);
+      throw new Error(`${act}失敗 (${res.status})：${lastText.slice(0, 300)}`);
     }
     if (!sawTransient || round >= MAX_ROUNDS) break;
     const wait = Math.min(35000, retryMs || 8000 * (round + 1));
@@ -226,7 +228,7 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
   if (lastStatus === 429) {
     throw new Error('額度受限，暫時無法完成。稍等 1–2 分鐘再按「繼續」通常就會繼續跑（進度已保存）。若一直卡住，代表這段音檔對免費層的「每分鐘用量」太大，建議到 AI Studio 開通 API 付費（最有效），或用較短的錄音。');
   }
-  throw new Error(`辨識失敗 (${lastStatus || ''})：${(lastText || '請重試').slice(0, 300)}`);
+  throw new Error(`${act}失敗 (${lastStatus || ''})：${(lastText || '請重試').slice(0, 300)}`);
 }
 
 // ---- 逐字稿（可依時間分段，長錄音自動切割）----
@@ -257,8 +259,13 @@ function mmss(sec) {
 }
 
 // uploads: [{ key, fileUri }]，每把金鑰用「自己上傳的那份檔案」，才不會 403
-async function transcribeWindow(uploads, mime, model, start, end, whole, onProgress, label, depth) {
-  const range = whole ? '' : `\n\n【只處理 ${mmss(start)} 到 ${mmss(end)} 這段時間範圍】的內容，此範圍以外請完全略過。說話者請從「說話者1」開始標記。`;
+// hintSpeakers: 先前段落已出現的說話者標籤 → 提示模型沿用，改善跨段語者一致性
+async function transcribeWindow(uploads, mime, model, start, end, whole, onProgress, label, depth, hintSpeakers) {
+  const known =
+    hintSpeakers && hintSpeakers.length
+      ? `已知先前段落已出現的說話者：${hintSpeakers.join('、')}。同一個人請「沿用相同標籤」，只有真的新出現的人才給新的「說話者N」編號。`
+      : '說話者請從「說話者1」開始標記。';
+  const range = whole ? '' : `\n\n【只處理 ${mmss(start)} 到 ${mmss(end)} 這段時間範圍】的內容，此範圍以外請完全略過。${known}`;
   const res = await postJsonRotating(
     uploads,
     (u) => ({
@@ -291,8 +298,8 @@ async function transcribeWindow(uploads, mime, model, start, end, whole, onProgr
   // 內容太密被截斷 → 對半再切（有時間範圍時才能切）
   if ((truncated || segments === null) && !whole && depth < 4 && end - start > 120) {
     const mid = Math.floor((start + end) / 2);
-    const a = await transcribeWindow(uploads, mime, model, start, mid, false, onProgress, label, depth + 1);
-    const b = await transcribeWindow(uploads, mime, model, mid, end, false, onProgress, label, depth + 1);
+    const a = await transcribeWindow(uploads, mime, model, start, mid, false, onProgress, label, depth + 1, hintSpeakers);
+    const b = await transcribeWindow(uploads, mime, model, mid, end, false, onProgress, label, depth + 1, hintSpeakers);
     return a.concat(b);
   }
   if (segments === null) {
@@ -308,12 +315,14 @@ async function transcribeAudio(uploads, mime, model, durationSec, onProgress) {
   }
   const n = Math.max(1, Math.ceil(durationSec / WINDOW_SEC));
   const all = [];
+  const seen = [];
   for (let i = 0; i < n; i++) {
     const start = i * WINDOW_SEC;
     const end = Math.min(durationSec, (i + 1) * WINDOW_SEC);
     const label = n > 1 ? `辨識第 ${i + 1}/${n} 段（${mmss(start)}–${mmss(end)}）…` : '辨識語者與逐字稿中…';
-    const segs = await transcribeWindow(uploads, mime, model, start, end, false, onProgress, label, 0);
+    const segs = await transcribeWindow(uploads, mime, model, start, end, false, onProgress, label, 0, seen.length ? seen.slice() : null);
     all.push(...segs);
+    for (const s of segs) if (s.speaker && !seen.includes(s.speaker)) seen.push(s.speaker);
   }
   return all;
 }
@@ -387,8 +396,9 @@ export async function uploadForJob(file, apiKeys, onProgress) {
   return { model, mime, uploads };
 }
 // 辨識單一時間段（含自動對半再切、多金鑰輪替）。uploads:[{key,fileUri}]
-export function transcribeRange(uploads, mime, model, start, end, whole, onProgress, label) {
-  return transcribeWindow(uploads, mime, model, start, end, whole, onProgress, label || '辨識中…', 0);
+// hintSpeakers: 先前段落的說話者標籤，提示模型沿用（跨段一致性）
+export function transcribeRange(uploads, mime, model, start, end, whole, onProgress, label, hintSpeakers) {
+  return transcribeWindow(uploads, mime, model, start, end, whole, onProgress, label || '辨識中…', 0, hintSpeakers);
 }
 
 // 挑選型號。opts.preferLite 可覆寫（辨識用全域省額度設定；摘要傳 false 用品質模型）

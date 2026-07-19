@@ -33,6 +33,17 @@ export function getGroupTombstones() {
 export function setGroupTombstones(ids) {
   localStorage.setItem(TOMB, JSON.stringify(Array.from(new Set(ids || []))));
 }
+const TOMB_TIME = 'meeting_group_tombstone_times';
+export function getGroupTombstoneTimes() {
+  try {
+    return JSON.parse(localStorage.getItem(TOMB_TIME)) || {};
+  } catch (_) {
+    return {};
+  }
+}
+export function setGroupTombstoneTimes(map) {
+  localStorage.setItem(TOMB_TIME, JSON.stringify(map || {}));
+}
 
 export function addGroup(name) {
   const gs = getGroups();
@@ -61,6 +72,9 @@ export function removeGroup(id) {
     t.push(id);
     setGroupTombstones(t);
   }
+  const times = getGroupTombstoneTimes();
+  times[id] = Date.now();
+  setGroupTombstoneTimes(times);
 }
 export function groupName(id) {
   const g = getGroups().find((x) => x.id === id);

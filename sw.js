@@ -1,6 +1,6 @@
 // Service Worker：快取 App 靜態殼，離線可開啟並瀏覽已存記錄。
 // Gemini API 一律走網路（不快取）。
-const CACHE = 'meeting-app-v40';
+const CACHE = 'meeting-app-v41';
 const ASSETS = [
   './',
   './index.html',
@@ -56,6 +56,7 @@ self.addEventListener('fetch', (e) => {
         caches.open(CACHE).then((c) => c.put(e.request, copy)).catch(() => {});
         return res;
       })
-      .catch(() => caches.match(e.request))
+      // 離線時回退到快取；ignoreSearch 讓帶 ?fresh=… 的強制更新網址也能命中 './'（否則離線白屏）
+      .catch(() => caches.match(e.request, { ignoreSearch: true }))
   );
 });

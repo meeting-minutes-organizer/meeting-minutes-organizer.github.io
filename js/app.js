@@ -1,8 +1,8 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
-import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
+import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
 import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting } from './gemini.js';
-import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
+import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v40';
+const APP_VERSION = 'v41';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -18,7 +18,6 @@ setPreferLite(getModelPref() === 'lite');
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
 const backBtn = document.getElementById('backBtn');
-const backupBtn = document.getElementById('backupBtn');
 
 document.getElementById('homeTab').onclick = () => (location.hash = '#/');
 const groupsTabEl = document.getElementById('groupsTab');
@@ -26,7 +25,6 @@ if (groupsTabEl) groupsTabEl.onclick = () => (location.hash = '#/groups');
 document.getElementById('newTab').onclick = () => (location.hash = '#/new');
 document.getElementById('settingsBtn').onclick = () => (location.hash = '#/settings');
 backBtn.onclick = () => (location.hash = '#/');
-backupBtn.onclick = () => onExport();
 
 const SPEAKER_PALETTE = ['#0a84ff', '#34c759', '#ff9500', '#af52de', '#ff2d55', '#5ac8fa', '#ffcc00'];
 
@@ -40,10 +38,9 @@ function esc(s) {
 function uid() {
   return crypto.randomUUID ? crypto.randomUUID() : 'm' + Date.now() + Math.round(performance.now());
 }
-function setHeader(text, showBack, showBackup) {
+function setHeader(text, showBack) {
   titleEl.textContent = text;
   backBtn.hidden = !showBack;
-  backupBtn.hidden = !showBackup;
   backBtn.onclick = () => (location.hash = '#/'); // 預設返回清單，個別頁面可覆寫
 }
 // 找出「這條摘要最可能出自哪一段逐字稿」：用字元二字組（bigram）重疊評分，免 API、即時
@@ -136,12 +133,15 @@ async function syncNow(silent) {
     const localState = async () => ({
       meetings: await list(),
       deleted: getTombstones(),
+      deletedAt: getTombstoneTimes(),
       groups: getGroups(),
       groupsDeleted: getGroupTombstones(),
+      groupsDeletedAt: getGroupTombstoneTimes(),
     });
     const applyGroups = (merged) => {
       setGroups(merged.groups || []);
       setGroupTombstones(merged.groupsDeleted || []);
+      setGroupTombstoneTimes(merged.groupsDeletedAt || {});
     };
     let remote = await sync.pull();
     let merged = mergeState(await localState(), remote.doc);
@@ -223,7 +223,7 @@ async function renderList(groupId) {
         ? all.filter((m) => m.group === groupId)
         : all;
   const title = groupId === '__none' ? '🗂 未分類' : groupId ? `📂 ${groupName(groupId) || '分類'}` : 'DD會議紀錄';
-  setHeader(title, !!groupId, meetings.length > 0);
+  setHeader(title, !!groupId);
   if (groupId) backBtn.onclick = () => (location.hash = '#/groups');
   if (!meetings.length) {
     view.innerHTML = `<div class="empty">${groupId ? '這個分類還沒有會議<br>到「清單」點會議卡片上的分類標籤加入' : '還沒有會議記錄<br>點下方「＋ 新增會議」上傳錄音檔'}</div>`;
@@ -278,7 +278,7 @@ async function renderList(groupId) {
 // 分類頁：群組清單（新增／改名／刪除／點入看該組會議）
 async function renderGroups() {
   const meetings = await list();
-  setHeader('分類', false, false);
+  setHeader('分類', false);
   const gs = getGroups();
   const known = new Set(gs.map((g) => g.id));
   const count = (gid) => meetings.filter((m) => m.group === gid).length;
@@ -336,7 +336,7 @@ async function renderGroups() {
 }
 
 async function onExport() {
-  const json = await exportAll({ groups: getGroups(), groupsDeleted: getGroupTombstones() });
+  const json = await exportAll({ groups: getGroups(), groupsDeleted: getGroupTombstones(), groupsDeletedAt: getGroupTombstoneTimes() });
   const blob = new Blob([json], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -362,18 +362,23 @@ async function importBackup(file) {
   const local = {
     meetings: await list(),
     deleted: getTombstones(),
+    deletedAt: getTombstoneTimes(),
     groups: getGroups(),
     groupsDeleted: getGroupTombstones(),
+    groupsDeletedAt: getGroupTombstoneTimes(),
   };
   const merged = mergeState(local, {
     meetings: doc.meetings || [],
     deleted: doc.deleted || [],
+    deletedAt: doc.deletedAt || {},
     groups: doc.groups || [],
     groupsDeleted: doc.groupsDeleted || [],
+    groupsDeletedAt: doc.groupsDeletedAt || {},
   });
   await applyMerged(merged);
   setGroups(merged.groups || []);
   setGroupTombstones(merged.groupsDeleted || []);
+  setGroupTombstoneTimes(merged.groupsDeletedAt || {});
   syncNow(true);
   return merged.meetings.length;
 }
@@ -598,6 +603,14 @@ async function processJob(job, container) {
 
     // 2) 逐段辨識（每段完成即存檔）
     const n = job.chunks.length;
+    // 收集先前各段已出現的說話者，提示後續段落沿用相同標籤（改善跨段語者一致性）
+    const collectSeen = () => {
+      const seen = [];
+      for (const ch of job.chunks) {
+        for (const s of ch.segments || []) if (s.speaker && !seen.includes(s.speaker)) seen.push(s.speaker);
+      }
+      return seen;
+    };
     for (let i = 0; i < n; i++) {
       if (job.chunks[i].segments) continue;
       const c = job.chunks[i];
@@ -608,7 +621,8 @@ async function processJob(job, container) {
       let label = '辨識語者與逐字稿中…';
       if (n > 1) label = job.mode === 'multi' ? `辨識第 ${i + 1}/${n} 支…` : `辨識第 ${i + 1}/${n} 段（${mmssApp(c.start)}–${mmssApp(c.end)}）…`;
       const whole = job.mode === 'whole' ? !!c.whole : true;
-      c.segments = await transcribeRange(c.uploads, c.mime || job.mime, job.model, c.start || 0, c.end || 0, whole, ui.onProgress, label);
+      const seen = collectSeen();
+      c.segments = await transcribeRange(c.uploads, c.mime || job.mime, job.model, c.start || 0, c.end || 0, whole, ui.onProgress, label, seen.length ? seen : null);
       ui.stopEase();
       await persistJob(job);
       ui.setBar(next);
@@ -1244,8 +1258,8 @@ function renderSettings() {
     </div>
     <div class="card">
       <p style="margin-top:0"><b>💾 備份 / 還原</b></p>
-      <button class="big secondary" id="exportBtn">⬇️ 匯出備份檔</button>
-      <button class="big secondary" id="importBtn" style="margin-top:8px">⬆️ 匯入備份檔</button>
+      <button class="big secondary" id="exportBtn">⬆️ 匯出備份檔</button>
+      <button class="big secondary" id="importBtn" style="margin-top:8px">⬇️ 匯入備份檔</button>
       <input type="file" id="importFile" accept="application/json,.json" hidden />
       <div class="hint">
         匯出會把<b>全部會議 + 分類群組</b>存成一個 JSON 檔。換手機或重灌時，用「匯入備份檔」還原——匯入會與現有資料<b>智慧合併</b>（不會覆蓋較新的內容、不會產生重複）。
@@ -1377,6 +1391,15 @@ router();
 // 啟動時若已開啟雲端同步：先拉取合併，再重新整理當前畫面
 if (sync.isEnabled()) {
   syncNow(true).then(() => router());
+}
+
+// 強制更新後網址會帶 ?fresh=…，載入完成後把它清掉（保持網址乾淨、離線也好命中快取）
+if (location.search.includes('fresh=')) {
+  try {
+    const u = new URL(location.href);
+    u.search = '';
+    history.replaceState(null, '', u.toString());
+  } catch (_) {}
 }
 
 // 啟動畫面：載入後淡出移除
