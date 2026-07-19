@@ -500,7 +500,7 @@ export async function regenerateSummary(segments, apiKeys, opts = {}) {
 }
 
 // ---- 翻譯（純文字，很省）：固定用品質模型；逐字稿分批翻避免超過輸出上限 ----
-const LANG_LABEL = { en: 'English', ja: '日本語 (Japanese)' };
+const LANG_LABEL = { zh: '繁體中文 (Traditional Chinese)', en: 'English', ja: '日本語 (Japanese)' };
 const SUMMARY_TR_SCHEMA = {
   type: 'object',
   properties: {
@@ -513,7 +513,8 @@ const SUMMARY_TR_SCHEMA = {
 
 async function translatePayload(variants, model, label, payload, schema, onProgress, progressMsg) {
   const prompt =
-    `You are a professional meeting-notes translator. Translate ALL text values in the following JSON into ${label}. ` +
+    `You are a professional meeting-notes translator. The source text may MIX several languages (e.g. Chinese, English, Japanese). ` +
+    `Translate EVERYTHING in the following JSON into ${label}, so the entire output is uniformly in ${label} (translate the parts that are already in another language too). ` +
     `Translate speaker labels too (e.g. "說話者1" → "Speaker 1" / "話者1"). ` +
     `Keep the EXACT same JSON structure, the same array lengths and order — translate values only; do NOT add, remove, merge or reorder items. ` +
     `Keep any "[DRI: ...]" tag; render "問：/答：" as the ${label} equivalent (e.g. "Q:/A:"). Output JSON only.\n\n` +

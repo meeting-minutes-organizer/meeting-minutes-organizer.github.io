@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, regenerateSummary, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, regenerateSummary, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting } from './gemini.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
@@ -9,7 +9,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v32';
+const APP_VERSION = 'v33';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -521,7 +521,7 @@ async function renderDetail(id) {
     return;
   }
   setHeader('會議詳情', true);
-  let lang = 'zh';
+  let lang = 'orig';
 
   const olHtml = (arr) =>
     arr && arr.length
@@ -543,12 +543,12 @@ async function renderDetail(id) {
       : '無';
 
   const contentFor = (l) => {
-    if (l === 'zh') return { transcript: m.transcript || [], summary: m.summary || {} };
+    if (l === 'orig') return { transcript: m.transcript || [], summary: m.summary || {} };
     const t = m.translations && m.translations[l];
     return t ? { transcript: t.transcript || [], summary: t.summary || {} } : null;
   };
   const viewMeeting = () => {
-    const c = contentFor(lang) || contentFor('zh');
+    const c = contentFor(lang) || contentFor('orig');
     return Object.assign({}, m, { transcript: c.transcript, summary: c.summary });
   };
 
@@ -557,7 +557,8 @@ async function renderDetail(id) {
       <input type="text" id="titleInput" value="${esc(m.title)}" />
       <div class="meta" style="margin-top:8px">${formatDate(m.createdAt)}</div>
       <div class="lang-toggle" id="langToggle">
-        <button data-l="zh" class="active">中文</button>
+        <button data-l="orig" class="active">原文</button>
+        <button data-l="zh">中文</button>
         <button data-l="en">English</button>
         <button data-l="ja">日本語</button>
       </div>
@@ -592,10 +593,10 @@ async function renderDetail(id) {
     const segHtml = (c.transcript || [])
       .map((seg) => `<div class="seg"><span class="spk" style="color:${colors[seg.speaker] || 'var(--ink)'}">${esc(seg.speaker)}</span>${esc(seg.text)}</div>`)
       .join('');
-    const isZh = l === 'zh';
+    const isOrig = l === 'orig';
     const speakers = Object.keys(colors);
     const chipsHtml =
-      isZh && speakers.length
+      isOrig && speakers.length
         ? `<div class="spk-rename">${speakers
             .map((sp) => `<button class="spk-chip" data-spk="${esc(sp)}" style="color:${colors[sp]};border-color:${colors[sp]}">✎ ${esc(sp)}</button>`)
             .join('')}</div>`
@@ -627,7 +628,7 @@ async function renderDetail(id) {
       };
     });
 
-    if (isZh) {
+    if (isOrig) {
       bodyEl.querySelectorAll('.spk-chip').forEach((chip) => {
         chip.onclick = async () => {
           const cur = chip.dataset.spk;
@@ -681,11 +682,11 @@ async function renderDetail(id) {
 
   const setLang = async (l) => {
     document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === l));
-    if (l !== 'zh' && !contentFor(l)) {
+    if (l !== 'orig' && !contentFor(l)) {
       lang = l;
       if (!hasApiKey()) {
-        bodyEl.innerHTML = `<div class="card"><div class="err">請先到右上角 ⚙︎ 設定，填入你的 Gemini API 金鑰，才能翻譯。<br>（金鑰是每台裝置各自設定的）</div><button class="big secondary" id="backZh" style="margin-top:10px">返回中文</button></div>`;
-        document.getElementById('backZh').onclick = () => setLang('zh');
+        bodyEl.innerHTML = `<div class="card"><div class="err">請先到右上角 ⚙︎ 設定，填入你的 Gemini API 金鑰，才能翻譯。<br>（金鑰是每台裝置各自設定的）</div><button class="big secondary" id="backZh" style="margin-top:10px">返回原文</button></div>`;
+        document.getElementById('backZh').onclick = () => setLang('orig');
         return;
       }
       drawBody(l); // 顯示「翻譯中…」
@@ -706,12 +707,12 @@ async function renderDetail(id) {
         if (lang !== l) return; // 使用者已切走
         bodyEl.innerHTML = `<div class="card"><div class="err">❌ 翻譯失敗：${esc(e && e.message ? e.message : e)}</div>
           <button class="big" id="retryTr" style="margin-top:10px">重試翻譯</button>
-          <button class="big secondary" id="backZh" style="margin-top:8px">返回中文</button></div>`;
+          <button class="big secondary" id="backZh" style="margin-top:8px">返回原文</button></div>`;
         document.getElementById('retryTr').onclick = () => {
           if (m.translations) delete m.translations[l];
           setLang(l);
         };
-        document.getElementById('backZh').onclick = () => setLang('zh');
+        document.getElementById('backZh').onclick = () => setLang('orig');
       }
     } else {
       lang = l;
@@ -794,7 +795,7 @@ async function renderDetail(id) {
     }
   };
 
-  drawBody('zh');
+  drawBody('orig');
 }
 
 function renderSettings() {
