@@ -1,7 +1,7 @@
-import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey } from './settings.js';
+import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, regenerateSummary, pickModelForKeys, uploadBlobToKeys } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, regenerateSummary, pickModelForKeys, uploadBlobToKeys, setPreferLite } from './gemini.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
@@ -9,7 +9,10 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v28';
+const APP_VERSION = 'v29';
+
+// 套用辨識模型偏好（省額度模式 → Flash-Lite）
+setPreferLite(getModelPref() === 'lite');
 
 const view = document.getElementById('view');
 const titleEl = document.getElementById('title');
@@ -766,6 +769,16 @@ function renderSettings() {
       </div>
     </div>
     <div class="card">
+      <p style="margin-top:0"><b>🎚️ 辨識模型</b></p>
+      <div class="lang-toggle" id="modelToggle">
+        <button data-mp="auto" class="${getModelPref() === 'lite' ? '' : 'active'}">自動（品質優先）</button>
+        <button data-mp="lite" class="${getModelPref() === 'lite' ? 'active' : ''}">省額度（較不會卡）</button>
+      </div>
+      <div class="hint">
+        免費層一直撞到「用量上限（429）」跑不動時，切到<b>省額度</b>：改用 <b>Flash-Lite</b> 模型，免費層每分鐘額度大很多（約 4 倍），長錄音較不會卡；代價是辨識品質略降一點。可隨時切回。
+      </div>
+    </div>
+    <div class="card">
       <p style="margin-top:0"><b>☁️ GitHub 雲端同步（跨裝置記憶）</b>
         <span class="meta">${enabled ? '｜狀態：已開啟' : '｜狀態：未開啟（只存本機）'}</span></p>
       <input type="password" id="ghToken" placeholder="貼上你的 GitHub 權杖（token）" value="${esc(cfg.token || '')}" autocomplete="off" />
@@ -837,6 +850,18 @@ function renderSettings() {
   const usageTimer = setInterval(() => {
     if (!drawUsage()) clearInterval(usageTimer);
   }, 1000);
+
+  // 辨識模型偏好切換
+  document.querySelectorAll('#modelToggle button').forEach((b) => {
+    b.onclick = () => {
+      const mp = b.dataset.mp;
+      setModelPref(mp);
+      setPreferLite(mp === 'lite');
+      document.querySelectorAll('#modelToggle button').forEach((x) => x.classList.toggle('active', x.dataset.mp === mp));
+      toast(mp === 'lite' ? '已切換到省額度（Flash-Lite）' : '已切換到自動（品質優先）');
+    };
+  });
+
   document.getElementById('saveSync').onclick = async () => {
     const token = document.getElementById('ghToken').value.trim();
     const repoField = document.getElementById('ghRepo').value.trim();

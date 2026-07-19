@@ -38,3 +38,12 @@ export function setApiKey(value) {
   const keys = (value || '').split(/[\n,]+/).map((s) => s.trim()).filter(Boolean);
   setApiKeyEntries(keys.map((k) => ({ name: '', key: k })));
 }
+
+// 辨識模型偏好：'auto'（品質優先）| 'lite'（省額度，用 Flash-Lite，較不會卡）
+const MP = 'model_pref';
+export function getModelPref() {
+  return localStorage.getItem(MP) || 'auto';
+}
+export function setModelPref(v) {
+  localStorage.setItem(MP, v === 'lite' ? 'lite' : 'auto');
+}

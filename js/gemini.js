@@ -10,9 +10,16 @@ import { recordUse, recordCooldown } from './usage.js';
 
 const BASE = 'https://generativelanguage.googleapis.com';
 
-// 動態挑選型號：向 API 詢問目前可用的模型，挑最適合做「長音檔 + 語者辨識」的 flash 型號。
+// 省額度模式：偏好 Flash-Lite（免費層每分鐘 token 上限高很多，較不會撞 429）
+let preferLite = false;
+export function setPreferLite(v) {
+  preferLite = !!v;
+}
+
+// 動態挑選型號：向 API 詢問目前可用的模型，挑最適合的。
 // 這樣 Google 汰換型號名稱（如 2.5-flash → 3.5-flash）時 App 不會壞。
-export function pickModel(models) {
+export function pickModel(models, opts = {}) {
+  const lite = opts.preferLite != null ? opts.preferLite : preferLite;
   const bad = /embedding|aqa|imagen|image|veo|tts|audio-native|gemma|learnlm|robotics|computer-use|live/i;
   const scored = (models || [])
     .map((m) => {
@@ -22,9 +29,17 @@ export function pickModel(models) {
       if (bad.test(name)) return null;
       const ver = (name.match(/gemini-(\d+(?:\.\d+)?)/) || [])[1];
       let score = (ver ? parseFloat(ver) : 0) * 100;
-      if (/flash/.test(name) && !/flash-lite/.test(name)) score += 40; // flash：快、免費額度高
-      else if (/pro/.test(name)) score += 25;
-      else if (/flash-lite/.test(name)) score += 15;
+      const isLite = /flash-lite/.test(name);
+      if (lite) {
+        // 省額度：讓 flash-lite 勝過版本差（大幅加分）
+        if (isLite) score += 300;
+        else if (/flash/.test(name)) score += 20;
+        else if (/pro/.test(name)) score += 8;
+      } else {
+        if (/flash/.test(name) && !isLite) score += 40; // flash：品質好
+        else if (/pro/.test(name)) score += 25;
+        else if (isLite) score += 15;
+      }
       if (/preview|exp|thinking|latest/.test(name)) score -= 12; // 偏好穩定版
       return { name, score };
     })
