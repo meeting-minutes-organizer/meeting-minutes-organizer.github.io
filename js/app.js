@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, regenerateSummary, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting } from './gemini.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
@@ -9,7 +9,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v33';
+const APP_VERSION = 'v34';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -568,7 +568,6 @@ async function renderDetail(id) {
         <button class="act-btn" id="wordBtn">📝 Word</button>
       </div>
       <div class="act-grid">
-        <button class="act-btn" id="regenBtn">🔄 重整摘要</button>
         <button class="act-btn" data-enh="actionItems">✅ 加強待辦</button>
         <button class="act-btn" data-enh="mainPoints">📌 加強重點</button>
         <button class="act-btn" data-enh="qa">❓ 加強Q&A</button>
@@ -649,37 +648,6 @@ async function renderDetail(id) {
     }
   };
 
-  async function doRegen() {
-    if (!hasApiKey()) {
-      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
-      return;
-    }
-    if (!(m.transcript && m.transcript.length)) {
-      alert('這場沒有逐字稿，無法重整摘要');
-      return;
-    }
-    if (!confirm('用現有逐字稿重新整理摘要？會覆蓋目前的待辦／重點／Q&A。')) return;
-    const btn = document.getElementById('regenBtn');
-    btn.disabled = true;
-    const old = btn.textContent;
-    try {
-      const summary = await regenerateSummary(m.transcript, getApiKeyEntries(), {
-        onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '處理中…')),
-      });
-      m.summary = summary;
-      m.translations = {}; // 摘要改了，清掉舊翻譯
-      m.updatedAt = Date.now();
-      await save(m);
-      syncNow();
-      renderDetail(id);
-      toast('摘要已更新 ✓');
-    } catch (e) {
-      alert('重整失敗：' + (e && e.message ? e.message : e));
-      btn.disabled = false;
-      btn.textContent = old;
-    }
-  }
-
   const setLang = async (l) => {
     document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === l));
     if (l !== 'orig' && !contentFor(l)) {
@@ -723,7 +691,6 @@ async function renderDetail(id) {
 
   document.getElementById('pdfBtn').onclick = () => exportPdf(viewMeeting());
   document.getElementById('wordBtn').onclick = () => exportWord(viewMeeting());
-  document.getElementById('regenBtn').onclick = doRegen;
 
   // 加強某一區塊（分段掃整份逐字稿抓完整清單）
   const doEnhance = async (section, btn) => {
