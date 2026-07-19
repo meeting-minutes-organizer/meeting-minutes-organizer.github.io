@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v39';
+const APP_VERSION = 'v40';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -31,7 +31,11 @@ backupBtn.onclick = () => onExport();
 const SPEAKER_PALETTE = ['#0a84ff', '#34c759', '#ff9500', '#af52de', '#ff2d55', '#5ac8fa', '#ffcc00'];
 
 function esc(s) {
-  return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
+  // 含引號跳脫：避免把使用者/AI/雲端文字插進 HTML 屬性時被注入（attribute injection XSS）
+  return String(s == null ? '' : s).replace(
+    /[&<>"']/g,
+    (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c])
+  );
 }
 function uid() {
   return crypto.randomUUID ? crypto.randomUUID() : 'm' + Date.now() + Math.round(performance.now());
@@ -70,6 +74,12 @@ export function bestSegIndex(text, transcript) {
     }
   });
   return bestScore >= 2 ? best : -1;
+}
+
+// 逐字稿指紋：段數 + 各段語者/文字長度，用來偵測「翻譯期間原文是否被改動」
+function transcriptFingerprint(transcript) {
+  const t = transcript || [];
+  return t.length + ':' + t.map((s) => (s.speaker || '').length + '.' + (s.text || '').length).join(',');
 }
 
 function speakerColors(segments) {
@@ -112,8 +122,14 @@ window.addEventListener('beforeunload', (e) => {
 });
 
 let syncing = false;
+let pendingSync = false;
 async function syncNow(silent) {
-  if (!sync.isEnabled() || syncing) return;
+  if (!sync.isEnabled()) return;
+  // 同步進行中又有新變更 → 標記 pending，等這輪結束後自動再跑一次（不丟失變更）
+  if (syncing) {
+    pendingSync = true;
+    return;
+  }
   syncing = true;
   try {
     if (!silent) toast('雲端同步中…');
@@ -149,6 +165,11 @@ async function syncNow(silent) {
     toast('同步失敗：' + (e && e.message ? e.message : e));
   } finally {
     syncing = false;
+    // 這輪同步期間若有新變更被標記 → 自動再跑一次，確保不遺漏
+    if (pendingSync) {
+      pendingSync = false;
+      syncNow(true);
+    }
   }
 }
 
@@ -237,10 +258,13 @@ async function renderList(groupId) {
           if (!m) return;
           const r = await pickGroup(m.group);
           if (r === undefined) return;
-          if (r === null) delete m.group;
-          else m.group = r;
-          m.updatedAt = Date.now();
-          await save(m);
+          const fresh = (await get(m.id)) || m;
+          if (r === null) delete fresh.group;
+          else fresh.group = r;
+          const now = Date.now();
+          fresh.updatedAt = now;
+          fresh.editedAt = now; // 分類是真實編輯
+          await save(fresh);
           syncNow();
           router();
         };
@@ -312,7 +336,7 @@ async function renderGroups() {
 }
 
 async function onExport() {
-  const json = await exportAll();
+  const json = await exportAll({ groups: getGroups(), groupsDeleted: getGroupTombstones() });
   const blob = new Blob([json], { type: 'application/json' });
   const a = document.createElement('a');
   a.href = URL.createObjectURL(blob);
@@ -321,6 +345,37 @@ async function onExport() {
   a.click();
   a.remove();
   URL.revokeObjectURL(a.href);
+}
+
+// 匯入備份：解析 JSON → 用現成的 mergeState 與本機合併（天然去重，不覆蓋較新的資料）
+async function importBackup(file) {
+  const text = await file.text();
+  let doc;
+  try {
+    doc = JSON.parse(text);
+  } catch (_) {
+    throw new Error('這不是有效的備份檔（JSON 解析失敗）');
+  }
+  if (!doc || !Array.isArray(doc.meetings)) {
+    throw new Error('備份檔格式不符（找不到 meetings）');
+  }
+  const local = {
+    meetings: await list(),
+    deleted: getTombstones(),
+    groups: getGroups(),
+    groupsDeleted: getGroupTombstones(),
+  };
+  const merged = mergeState(local, {
+    meetings: doc.meetings || [],
+    deleted: doc.deleted || [],
+    groups: doc.groups || [],
+    groupsDeleted: doc.groupsDeleted || [],
+  });
+  await applyMerged(merged);
+  setGroups(merged.groups || []);
+  setGroupTombstones(merged.groupsDeleted || []);
+  syncNow(true);
+  return merged.meetings.length;
 }
 
 function renderNew() {
@@ -399,7 +454,10 @@ function buildWindows(durationSec) {
 }
 async function persistJob(job) {
   const clean = { ...job };
+  // 原始音檔（單檔 _file / 多檔 _files）都是暫存的大物件，絕不寫進 IndexedDB
+  // （否則多檔長錄音會把數百 MB File 反覆序列化進 DB，iOS 上極慢甚至爆配額）
   delete clean._file;
+  delete clean._files;
   await saveJob(clean);
 }
 
@@ -605,6 +663,18 @@ async function openJobProgress(job) {
 }
 
 async function startNewTranscription(files) {
+  // 防止辨識中又開第二個任務（兩者共用 job id 'active' 會互相覆寫、燒雙倍額度）
+  if (jobRunning) {
+    alert('已有一場辨識正在進行中，請等它完成或先返回查看進度。');
+    return;
+  }
+  const active = await getActiveJob();
+  if (active && !active.done) {
+    if (!confirm('偵測到尚有未完成的辨識任務。要「捨棄」它並開始新的嗎？\n（按取消可回上一頁從中斷處繼續）')) {
+      return;
+    }
+    await clearJob(active.id);
+  }
   const list = (Array.isArray(files) ? files.slice() : [files]).sort((a, b) =>
     a.name.localeCompare(b.name, undefined, { numeric: true })
   );
@@ -687,13 +757,29 @@ function getAudioDuration(file) {
 }
 
 async function renderDetail(id) {
-  const m = await get(id);
+  let m = await get(id);
   if (!m) {
     location.hash = '#/';
     return;
   }
   setHeader('會議詳情', true);
   let lang = 'orig';
+
+  // 統一存檔：存前先從 DB 重讀最新版，把本次變更套在最新資料上再存
+  // → 避免畫面重繪或另一個 async handler 用「舊的 m」整份覆寫（stale closure 競態）。
+  // opts.edit=true 代表真實內容編輯（逐字稿/摘要/標題/分類），會 bump editedAt；
+  // 翻譯、問答等衍生資料不傳 edit → 只動 updatedAt，合併時不會蓋掉別台的真實編輯。
+  const persist = async (mutate, opts = {}) => {
+    const fresh = (await get(id)) || m;
+    mutate(fresh);
+    const now = Date.now();
+    fresh.updatedAt = now;
+    if (opts.edit) fresh.editedAt = now;
+    await save(fresh);
+    m = fresh;
+    if (opts.sync !== false) syncNow();
+    return fresh;
+  };
 
   const olHtml = (arr, key) =>
     arr && arr.length
@@ -886,11 +972,11 @@ async function renderDetail(id) {
             e.stopPropagation();
             const nt = ta.value.trim();
             if (nt && nt !== seg.text) {
-              seg.text = nt;
-              m.translations = {}; // 原文改了，清掉舊翻譯
-              m.updatedAt = Date.now();
-              await save(m);
-              syncNow();
+              const segIdx = i;
+              await persist((fresh) => {
+                if (fresh.transcript && fresh.transcript[segIdx]) fresh.transcript[segIdx].text = nt;
+                fresh.translations = {}; // 原文改了，清掉舊翻譯
+              }, { edit: true });
               toast('已修改 ✓');
             }
             drawBody('orig');
@@ -903,13 +989,12 @@ async function renderDetail(id) {
           const nn = prompt(`把「${cur}」改成：`, cur);
           if (nn && nn.trim() && nn.trim() !== cur) {
             const name = nn.trim();
-            m.transcript.forEach((seg) => {
-              if (seg.speaker === cur) seg.speaker = name;
-            });
-            m.translations = {}; // 原文改了，清掉舊翻譯
-            m.updatedAt = Date.now();
-            await save(m);
-            syncNow();
+            await persist((fresh) => {
+              (fresh.transcript || []).forEach((seg) => {
+                if (seg.speaker === cur) seg.speaker = name;
+              });
+              fresh.translations = {}; // 原文改了，清掉舊翻譯
+            }, { edit: true });
             renderDetail(id);
           }
         };
@@ -928,17 +1013,26 @@ async function renderDetail(id) {
       }
       drawBody(l); // 顯示「翻譯中…」
       try {
+        const fp = transcriptFingerprint(m.transcript); // 翻譯前記錄逐字稿指紋
         const tr = await translateMeeting(m.transcript, m.summary, l, getApiKeyEntries(), {
           onProgress: (info) => {
             const el = document.getElementById('tprogmsg');
             if (el && info && info.message) el.textContent = info.message;
           },
         });
-        m.translations = m.translations || {};
-        m.translations[l] = tr;
-        m.updatedAt = Date.now();
-        await save(m);
-        syncNow();
+        // 翻譯期間若原文被改過（指紋不符）→ 丟棄這份翻譯，不落盤（避免存下對不上的翻譯）
+        const cur = await get(id);
+        if (cur && transcriptFingerprint(cur.transcript) !== fp) {
+          if (lang === l) {
+            setLang('orig');
+            toast('原文已變更，請重新翻譯');
+          }
+          return;
+        }
+        await persist((fresh) => {
+          fresh.translations = fresh.translations || {};
+          fresh.translations[l] = tr;
+        });
         if (lang === l) drawBody(l);
       } catch (e) {
         if (lang !== l) return; // 使用者已切走
@@ -979,12 +1073,11 @@ async function renderDetail(id) {
       const items = await enhanceSection(m.transcript, section, getApiKeyEntries(), {
         onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '處理中…')),
       });
-      m.summary = m.summary || {};
-      m.summary[section] = items;
-      m.translations = {}; // 內容改了 → 清掉舊翻譯
-      m.updatedAt = Date.now();
-      await save(m);
-      syncNow();
+      await persist((fresh) => {
+        fresh.summary = fresh.summary || {};
+        fresh.summary[section] = items;
+        fresh.translations = {}; // 內容改了 → 清掉舊翻譯
+      }, { edit: true });
       renderDetail(id);
       toast(`已加強${nameMap[section]}（共 ${items.length} 筆）`);
     } catch (e) {
@@ -1051,10 +1144,9 @@ async function renderDetail(id) {
   drawChat();
   chatClearBtn.onclick = async () => {
     if (!confirm('清除這場會議的所有問答紀錄？')) return;
-    m.chat = [];
-    m.updatedAt = Date.now();
-    await save(m);
-    syncNow();
+    await persist((fresh) => {
+      fresh.chat = [];
+    });
     drawChat();
   };
   document.getElementById('chatAsk').onclick = async () => {
@@ -1076,11 +1168,10 @@ async function renderDetail(id) {
       const a = await askMeeting(m.transcript, m.summary, q, getApiKeyEntries(), {
         onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '思考中…')),
       });
-      m.chat = m.chat || [];
-      m.chat.push({ q, a, at: Date.now() });
-      m.updatedAt = Date.now();
-      await save(m);
-      syncNow();
+      await persist((fresh) => {
+        fresh.chat = fresh.chat || [];
+        fresh.chat.push({ q, a, at: Date.now() });
+      });
       inp.value = '';
       drawChat();
       chatLogEl.lastElementChild && chatLogEl.lastElementChild.scrollIntoView({ block: 'nearest' });
@@ -1093,10 +1184,10 @@ async function renderDetail(id) {
   };
 
   document.getElementById('titleInput').onchange = async (e) => {
-    m.title = e.target.value.trim() || m.title;
-    m.updatedAt = Date.now();
-    await save(m);
-    syncNow();
+    const nt = e.target.value.trim();
+    await persist((fresh) => {
+      fresh.title = nt || fresh.title;
+    }, { edit: true });
   };
   document.getElementById('del').onclick = async () => {
     if (confirm('確定刪除這場會議記錄？此動作無法復原。')) {
@@ -1149,6 +1240,15 @@ function renderSettings() {
         1. 在 GitHub 建一個<b>私人 repo</b>（例如 <code>my-notes-data</code>），把「你的帳號/repo名」填在上面欄位。<br>
         2. 到 <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained tokens</a> → Repository access 選那個 repo → Permissions 的 <b>Contents</b> 設 <b>Read and write</b> → 產生後貼到上面。<br>
         權杖與記錄都只存你自己的裝置與你自己的 repo。
+      </div>
+    </div>
+    <div class="card">
+      <p style="margin-top:0"><b>💾 備份 / 還原</b></p>
+      <button class="big secondary" id="exportBtn">⬇️ 匯出備份檔</button>
+      <button class="big secondary" id="importBtn" style="margin-top:8px">⬆️ 匯入備份檔</button>
+      <input type="file" id="importFile" accept="application/json,.json" hidden />
+      <div class="hint">
+        匯出會把<b>全部會議 + 分類群組</b>存成一個 JSON 檔。換手機或重灌時，用「匯入備份檔」還原——匯入會與現有資料<b>智慧合併</b>（不會覆蓋較新的內容、不會產生重複）。
       </div>
     </div>
     <div class="card">
@@ -1241,6 +1341,24 @@ function renderSettings() {
   document.getElementById('forceUpdateBtn').onclick = () => {
     toast('更新中…');
     forceUpdate();
+  };
+
+  // 備份 / 還原
+  document.getElementById('exportBtn').onclick = () => onExport();
+  const importInput = document.getElementById('importFile');
+  document.getElementById('importBtn').onclick = () => importInput.click();
+  importInput.onchange = async (e) => {
+    const f = (e.target.files || [])[0];
+    if (!f) return;
+    try {
+      toast('匯入中…');
+      const n = await importBackup(f);
+      toast(`匯入完成，目前共 ${n} 場會議 ✓`);
+    } catch (err) {
+      alert('匯入失敗：' + (err && err.message ? err.message : err));
+    } finally {
+      importInput.value = ''; // 允許重選同一個檔案
+    }
   };
 }
 

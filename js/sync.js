@@ -28,6 +28,45 @@ export function isEnabled() {
 function stamp(m) {
   return m.updatedAt || m.createdAt || 0;
 }
+// 「真實編輯」時間戳：只在改逐字稿/摘要/標題/分類時 bump（見 app.js）。
+// 翻譯、問答等衍生資料不會動它 → 合併時不會蓋掉別台裝置的真實編輯。
+function editStamp(m) {
+  return m.editedAt || m.updatedAt || m.createdAt || 0;
+}
+const ID_RE = /^[\w-]{1,64}$/; // 合法 id 白名單（防雲端注入惡意 id 到 HTML 屬性）
+
+// 聊天問答：兩邊以 at 去重聯集（任一台問的問題都保留）
+function mergeChat(a, b) {
+  const seen = new Set();
+  const out = [];
+  for (const c of [...(a || []), ...(b || [])]) {
+    if (!c) continue;
+    const k = String(c.at || '') + '|' + String(c.q || '');
+    if (seen.has(k)) continue;
+    seen.add(k);
+    out.push(c);
+  }
+  return out.sort((x, y) => (x.at || 0) - (y.at || 0));
+}
+
+// 合併同一場會議的兩個版本：主體（逐字稿/摘要/標題）取 editStamp 較新者，
+// 聊天做聯集，翻譯只在同一逐字稿版本（editStamp 相同）時互補。
+function mergeMeeting(a, b) {
+  if (!a) return b;
+  if (!b) return a;
+  const base = editStamp(a) >= editStamp(b) ? a : b;
+  const other = base === a ? b : a;
+  const merged = { ...base };
+  const chat = mergeChat(a.chat, b.chat);
+  if (chat.length) merged.chat = chat;
+  if (editStamp(a) === editStamp(b)) {
+    // 同一逐字稿版本 → 兩邊翻譯互補（base 優先）
+    merged.translations = { ...(other.translations || {}), ...(base.translations || {}) };
+  }
+  merged.updatedAt = Math.max(a.updatedAt || 0, b.updatedAt || 0);
+  return merged;
+}
+
 export function mergeState(a, b) {
   const A = a || { meetings: [], deleted: [] };
   const B = b || { meetings: [], deleted: [] };
@@ -35,19 +74,18 @@ export function mergeState(a, b) {
   const delSet = new Set(deleted);
   const byId = new Map();
   for (const m of [...(A.meetings || []), ...(B.meetings || [])]) {
-    if (!m || !m.id || delSet.has(m.id)) continue;
-    const prev = byId.get(m.id);
-    if (!prev || stamp(m) >= stamp(prev)) byId.set(m.id, m);
+    if (!m || !m.id || !ID_RE.test(m.id) || delSet.has(m.id)) continue;
+    byId.set(m.id, mergeMeeting(byId.get(m.id), m));
   }
   const meetings = Array.from(byId.values()).sort((x, y) => y.createdAt - x.createdAt);
-  // 分類群組也一樣合併（墓碑 + updatedAt 較新者勝）
+  // 分類群組合併（墓碑 + editStamp 較新者勝 + id 白名單）
   const groupsDeleted = Array.from(new Set([...(A.groupsDeleted || []), ...(B.groupsDeleted || [])]));
   const gDelSet = new Set(groupsDeleted);
   const gById = new Map();
   for (const g of [...(A.groups || []), ...(B.groups || [])]) {
-    if (!g || !g.id || gDelSet.has(g.id)) continue;
+    if (!g || !g.id || !ID_RE.test(g.id) || gDelSet.has(g.id)) continue;
     const prev = gById.get(g.id);
-    if (!prev || stamp(g) >= stamp(prev)) gById.set(g.id, g);
+    if (!prev || editStamp(g) >= editStamp(prev)) gById.set(g.id, g);
   }
   const groups = Array.from(gById.values()).sort((x, y) => (x.createdAt || 0) - (y.createdAt || 0));
   return { meetings, deleted, groups, groupsDeleted };
@@ -90,11 +128,31 @@ export async function pull() {
   if (res.status === 401) throw new Error('GitHub 權杖無效或已過期');
   if (!res.ok) throw new Error(`雲端讀取失敗 (${res.status})`);
   const data = await res.json();
+
+  // 取得檔案原始文字內容。
+  // GitHub Contents API：檔案 > 1MB 時 content 會是空字串、encoding='none'，
+  // 此時必須改用 raw media type 才拿得到內容（支援到 100MB）。
+  let raw;
+  if (data.content && data.encoding === 'base64') {
+    raw = b64decodeUtf8(data.content);
+  } else {
+    // 空內容或大檔 → 用 raw media type 重新抓一次
+    const rawRes = await fetch(apiUrl(c), {
+      headers: { ...authHeaders(c), Accept: 'application/vnd.github.raw+json' },
+    });
+    if (!rawRes.ok) throw new Error(`雲端讀取失敗 (raw ${rawRes.status})`);
+    raw = await rawRes.text();
+  }
+
+  // 解析失敗 → 中止同步並報錯（絕不能 fallback 成空文件，否則會把雲端整庫覆寫清空）
   let doc;
   try {
-    doc = JSON.parse(b64decodeUtf8(data.content));
-  } catch (_) {
-    doc = { meetings: [], deleted: [] };
+    doc = JSON.parse(raw);
+  } catch (e) {
+    throw new Error('雲端資料解析失敗，為保護資料已中止同步（請稍後再試）');
+  }
+  if (!doc || typeof doc !== 'object' || !Array.isArray(doc.meetings)) {
+    throw new Error('雲端資料格式異常，為保護資料已中止同步');
   }
   doc.meetings = doc.meetings || [];
   doc.deleted = doc.deleted || [];

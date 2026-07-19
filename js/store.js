@@ -72,9 +72,20 @@ export async function remove(id) {
   }
 }
 
-export async function exportAll() {
+// 備份匯出：包含會議、刪除墓碑、分類群組（讓沒開雲端同步的人也能完整還原）
+export async function exportAll(extra = {}) {
   const meetings = await list();
-  return JSON.stringify({ exportedAt: Date.now(), meetings }, null, 2);
+  return JSON.stringify(
+    {
+      exportedAt: Date.now(),
+      meetings,
+      deleted: getTombstones(),
+      groups: extra.groups || [],
+      groupsDeleted: extra.groupsDeleted || [],
+    },
+    null,
+    2
+  );
 }
 
 // ---- 刪除墓碑（供雲端同步跨裝置刪除）----

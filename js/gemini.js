@@ -344,7 +344,12 @@ async function summarizeSegments(segments, keys, model, onProgress) {
     data && data.candidates && data.candidates[0] && data.candidates[0].content &&
     data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
   if (!out) throw new Error('未取得摘要結果，請重試。');
-  const r = JSON.parse(out);
+  let r;
+  try {
+    r = JSON.parse(out);
+  } catch (_) {
+    throw new Error('摘要結果解析失敗，請按「繼續」重試。');
+  }
   return { actionItems: r.actionItems || [], mainPoints: r.mainPoints || [], qa: r.qa || [] };
 }
 
@@ -365,13 +370,20 @@ export async function uploadForJob(file, apiKeys, onProgress) {
   const model = await resolveModel(kos.map((k) => k.key));
   const uploads = [];
   let mime = file.type || 'audio/mpeg';
+  let lastErr = null;
   for (let i = 0; i < kos.length; i++) {
     if (kos.length > 1) report(onProgress, 'upload', 5, `上傳音檔中…（金鑰 ${i + 1}/${kos.length}）`, kos[i].name);
-    const info = await uploadFile(file, kos[i].key, onProgress);
-    const active = await waitActive(info, kos[i].key, onProgress);
-    uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
-    mime = active.mimeType || mime;
+    try {
+      const info = await uploadFile(file, kos[i].key, onProgress);
+      const active = await waitActive(info, kos[i].key, onProgress);
+      uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
+      mime = active.mimeType || mime;
+    } catch (e) {
+      // 單把金鑰上傳失敗（打錯字/專案停用）不該拖垮整個任務 → 略過這把，只要有一把成功就繼續
+      lastErr = e;
+    }
   }
+  if (!uploads.length) throw lastErr || new Error('音檔上傳失敗（所有金鑰皆無法使用）');
   return { model, mime, uploads };
 }
 // 辨識單一時間段（含自動對半再切、多金鑰輪替）。uploads:[{key,fileUri}]
@@ -391,12 +403,18 @@ export async function uploadBlobToKeys(blob, apiKeys, onProgress) {
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
   const uploads = [];
   let mime = blob.type || 'audio/mpeg';
+  let lastErr = null;
   for (let i = 0; i < kos.length; i++) {
-    const info = await uploadFile(blob, kos[i].key, onProgress);
-    const active = await waitActive(info, kos[i].key, onProgress);
-    uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
-    mime = active.mimeType || mime;
+    try {
+      const info = await uploadFile(blob, kos[i].key, onProgress);
+      const active = await waitActive(info, kos[i].key, onProgress);
+      uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
+      mime = active.mimeType || mime;
+    } catch (e) {
+      lastErr = e; // 單把失敗略過，至少一把成功即可繼續
+    }
   }
+  if (!uploads.length) throw lastErr || new Error('音檔上傳失敗（所有金鑰皆無法使用）');
   return { uploads, mime };
 }
 // 對整份逐字稿產生摘要（純文字，任何金鑰可用）
@@ -480,12 +498,15 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
     );
     const data = await res.json();
     const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
-    if (out) {
-      try {
-        const r = JSON.parse(out);
-        if (Array.isArray(r.items)) all.push(...r.items);
-      } catch (_) {}
+    // 批次失敗就 throw（不可靜默吞掉 → 否則整區被「缺一批」的不完整清單取代）
+    if (!out) throw new Error(`加強${meta.label}時第 ${Math.floor(i / BATCH) + 1} 批無回應，請重試`);
+    let r;
+    try {
+      r = JSON.parse(out);
+    } catch (_) {
+      throw new Error(`加強${meta.label}時第 ${Math.floor(i / BATCH) + 1} 批解析失敗，請重試`);
     }
+    if (Array.isArray(r.items)) all.push(...r.items);
   }
   return all;
 }
