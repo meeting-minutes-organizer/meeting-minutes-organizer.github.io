@@ -2,7 +2,7 @@ import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
 import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting } from './gemini.js';
-import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, addGroup, renameGroup, removeGroup, groupName } from './groups.js';
+import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v38';
+const APP_VERSION = 'v39';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -160,7 +160,7 @@ function pickGroup(current) {
     const gs = getGroups();
     ov.innerHTML = `<div class="sheet">
       <div class="sheet-title">設定分類</div>
-      ${gs.map((g) => `<button class="sheet-btn${g.id === current ? ' cur' : ''}" data-g="${g.id}">📂 ${esc(g.name)}${g.id === current ? ' ✓' : ''}</button>`).join('')}
+      ${gs.map((g) => `<button class="sheet-btn${g.id === current ? ' cur' : ''}" data-g="${g.id}"><span class="g-dot" style="background:${groupColor(g.id)}"></span>${esc(g.name)}${g.id === current ? ' ✓' : ''}</button>`).join('')}
       <button class="sheet-btn" data-g="__new">➕ 新增群組</button>
       ${current ? '<button class="sheet-btn" data-g="__none">🚫 移出分類</button>' : ''}
       <button class="sheet-btn cancel" data-g="__cancel">取消</button>
@@ -212,8 +212,9 @@ async function renderList(groupId) {
     const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
     const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
     const gn = m.group && known.has(m.group) ? groupName(m.group) : '';
+    const gc = gn ? groupColor(m.group) : '';
     return `<div class="card tap" data-id="${m.id}">
-        <div class="card-top"><h3>${esc(m.title)}</h3><button class="grp-chip${gn ? ' has' : ''}" type="button">📂 ${esc(gn || '未分類')}</button></div>
+        <div class="card-top"><h3>${esc(m.title)}</h3><button class="grp-chip${gn ? ' has' : ''}" type="button"${gn ? ` style="color:${gc};border-color:${gc};background:color-mix(in srgb, ${gc} 14%, transparent)"` : ''}><span class="g-dot" style="background:${gc || 'var(--muted)'}"></span>${esc(gn || '未分類')}</button></div>
         <div class="meta">${formatDate(m.createdAt)}</div>
         <div class="snippet">${esc(snip)}</div>
       </div>`;
@@ -262,15 +263,17 @@ async function renderGroups() {
     <button class="big" id="addGroupBtn">➕ 新增群組</button>
     <div id="groupList" style="margin-top:12px">
       ${gs
-        .map(
-          (g) => `<div class="card tap" data-g="${g.id}">
-            <div class="card-top"><h3>📂 ${esc(g.name)}</h3>
+        .map((g) => {
+          const gc = groupColor(g.id);
+          return `<div class="card tap group-card" data-g="${g.id}" style="border-left:5px solid ${gc}">
+            <div class="card-top">
+              <h3><span class="g-ico" style="background:color-mix(in srgb, ${gc} 20%, transparent);color:${gc}">📁</span>${esc(g.name)}</h3>
               <span class="grp-ops"><button class="grp-op g-edit" type="button" title="改名">✎</button><button class="grp-op g-del" type="button" title="刪除">🗑</button></span></div>
-            <div class="meta">${count(g.id)} 場會議</div>
-          </div>`
-        )
+            <div class="meta" style="color:${gc};font-weight:600">${count(g.id)} 場會議</div>
+          </div>`;
+        })
         .join('')}
-      ${unCount ? `<div class="card tap" data-g="__none"><h3>🗂 未分類</h3><div class="meta">${unCount} 場會議</div></div>` : ''}
+      ${unCount ? `<div class="card tap group-card" data-g="__none" style="border-left:5px solid var(--muted)"><div class="card-top"><h3><span class="g-ico" style="background:color-mix(in srgb, var(--muted) 20%, transparent)">🗂</span>未分類</h3></div><div class="meta">${unCount} 場會議</div></div>` : ''}
       ${!gs.length && !unCount ? '<div class="empty">還沒有群組<br>點上方「＋ 新增群組」建立</div>' : ''}
     </div>`;
   document.getElementById('addGroupBtn').onclick = () => {

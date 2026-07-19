@@ -4,6 +4,15 @@
 const KEY = 'meeting_groups';
 const TOMB = 'meeting_group_tombstones';
 
+// 群組調色盤：新群組依序取色，存進群組資料（會跟著雲端同步）
+export const GROUP_COLORS = ['#0a84ff', '#34c759', '#ff9500', '#af52de', '#ff2d55', '#5ac8fa', '#ffcc00', '#63e6be'];
+export function groupColor(id) {
+  const gs = getGroups();
+  const i = gs.findIndex((g) => g.id === id);
+  if (i < 0) return '#8e8e93';
+  return gs[i].color || GROUP_COLORS[i % GROUP_COLORS.length];
+}
+
 export function getGroups() {
   try {
     return (JSON.parse(localStorage.getItem(KEY)) || []).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
@@ -26,14 +35,15 @@ export function setGroupTombstones(ids) {
 }
 
 export function addGroup(name) {
+  const gs = getGroups();
   const g = {
     id: 'g' + Date.now() + Math.random().toString(36).slice(2, 6),
     name: String(name || '').trim(),
+    color: GROUP_COLORS[gs.length % GROUP_COLORS.length],
     createdAt: Date.now(),
     updatedAt: Date.now(),
   };
   if (!g.name) return null;
-  const gs = getGroups();
   gs.push(g);
   setGroups(gs);
   return g;
