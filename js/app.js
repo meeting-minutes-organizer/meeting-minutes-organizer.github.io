@@ -9,7 +9,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v29';
+const APP_VERSION = 'v30';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -383,11 +383,12 @@ async function processJob(job, container) {
       await persistJob(job);
       ui.setBar(next);
     }
-    // 3) 摘要
+    // 3) 摘要（重點/待辦/Q&A 很重要 → 固定用品質模型，不受省額度影響）
     ui.setLabel('整理摘要中…');
     ui.easeTo(99, 20);
     const allSegs = job.chunks.reduce((acc, c) => acc.concat(c.segments || []), []);
-    const summary = await summarize(allSegs, getApiKeyEntries(), job.model, ui.onProgress);
+    const summaryModel = await pickModelForKeys(getApiKeyEntries(), { preferLite: false });
+    const summary = await summarize(allSegs, getApiKeyEntries(), summaryModel, ui.onProgress);
     ui.stopEase();
     ui.setBar(100);
     ui.setLabel('完成！');

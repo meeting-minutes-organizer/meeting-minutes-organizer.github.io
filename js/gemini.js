@@ -48,11 +48,12 @@ export function pickModel(models, opts = {}) {
   return scored.length ? scored[0].name : null;
 }
 
-async function resolveModel(apiKey) {
+// opts.preferLite: 明確指定要不要用 Flash-Lite（辨識用全域設定；摘要/翻譯固定 false 品質優先）
+async function resolveModel(apiKey, opts = {}) {
   const res = await fetch(`${BASE}/v1beta/models?key=${apiKey}`);
   if (!res.ok) throw new Error(`取得可用型號失敗 (${res.status})：${(await res.text()).slice(0, 200)}`);
   const data = await res.json();
-  const name = pickModel(data.models || []);
+  const name = pickModel(data.models || [], { preferLite: opts.preferLite != null ? opts.preferLite : preferLite });
   if (!name) throw new Error('這組金鑰找不到可用的辨識型號，請確認金鑰是否正確、或是否已啟用 Gemini API。');
   return name;
 }
@@ -351,11 +352,11 @@ export function transcribeRange(uploads, mime, model, start, end, whole, onProgr
   return transcribeWindow(uploads, mime, model, start, end, whole, onProgress, label || '辨識中…', 0);
 }
 
-// 挑選型號（給切割模式一次用）
-export async function pickModelForKeys(apiKeys) {
+// 挑選型號。opts.preferLite 可覆寫（辨識用全域省額度設定；摘要傳 false 用品質模型）
+export async function pickModelForKeys(apiKeys, opts = {}) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
-  return resolveModel(kos[0].key);
+  return resolveModel(kos[0].key, opts);
 }
 // 把一個音檔（Blob/File）上傳到每一把金鑰的專案，回傳 { uploads:[{key,name,fileUri}], mime }
 export async function uploadBlobToKeys(blob, apiKeys, onProgress) {
@@ -409,50 +410,29 @@ export async function regenerateSummary(segments, apiKeys, opts = {}) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
   report(onProgress, 'model', 3, '選擇型號中…');
-  const model = await resolveModel(kos[0].key);
+  const model = await resolveModel(kos[0].key, { preferLite: false }); // 摘要固定用品質模型
   return summarizeSegments(segments, kos, model, onProgress);
 }
 
-// ---- 翻譯（純文字，很省；一次翻逐字稿+摘要）----
+// ---- 翻譯（純文字，很省）：固定用品質模型；逐字稿分批翻避免超過輸出上限 ----
 const LANG_LABEL = { en: 'English', ja: '日本語 (Japanese)' };
-const TRANSLATE_SCHEMA = {
+const SUMMARY_TR_SCHEMA = {
   type: 'object',
   properties: {
-    segments: {
-      type: 'array',
-      items: {
-        type: 'object',
-        properties: { speaker: { type: 'string' }, text: { type: 'string' } },
-        required: ['speaker', 'text'],
-      },
-    },
     actionItems: { type: 'array', items: { type: 'string' } },
     mainPoints: { type: 'array', items: { type: 'string' } },
     qa: { type: 'array', items: { type: 'string' } },
   },
-  required: ['segments', 'actionItems', 'mainPoints', 'qa'],
+  required: ['actionItems', 'mainPoints', 'qa'],
 };
 
-export async function translateMeeting(transcript, summary, targetLang, apiKeys, opts = {}) {
-  const onProgress = opts.onProgress;
-  const kos = toKeyObjs(apiKeys);
-  if (!kos.length) throw new Error('尚未設定 API 金鑰');
-  const label = LANG_LABEL[targetLang] || targetLang;
-  report(onProgress, 'model', 3, '選擇型號中…');
-  const model = await resolveModel(kos[0].key);
-  const payload = {
-    segments: transcript || [],
-    actionItems: (summary && summary.actionItems) || [],
-    mainPoints: (summary && (summary.mainPoints || summary.keyPoints)) || [],
-    qa: (summary && summary.qa) || [],
-  };
+async function translatePayload(variants, model, label, payload, schema, onProgress, progressMsg) {
   const prompt =
-    `You are a professional meeting-notes translator. Translate ALL text values in the following meeting JSON into ${label}. ` +
-    `Also translate the speaker labels (e.g. "說話者1" → an appropriate label such as "Speaker 1" / "話者1"). ` +
-    `Keep the EXACT same JSON structure, the same array lengths and the same order — translate the values only, do NOT add, remove, merge or reorder items. ` +
-    `In actionItems, keep the "[DRI: ...]" tag format. In qa keep the "問：/答：" style but in ${label} (e.g. "Q:/A:"). Output JSON only.\n\n` +
+    `You are a professional meeting-notes translator. Translate ALL text values in the following JSON into ${label}. ` +
+    `Translate speaker labels too (e.g. "說話者1" → "Speaker 1" / "話者1"). ` +
+    `Keep the EXACT same JSON structure, the same array lengths and order — translate values only; do NOT add, remove, merge or reorder items. ` +
+    `Keep any "[DRI: ...]" tag; render "問：/答：" as the ${label} equivalent (e.g. "Q:/A:"). Output JSON only.\n\n` +
     JSON.stringify(payload);
-  const variants = kos.map((k) => ({ key: k.key, name: k.name }));
   const res = await postJsonRotating(
     variants,
     (v) => ({
@@ -461,23 +441,71 @@ export async function translateMeeting(transcript, summary, targetLang, apiKeys,
         contents: [{ parts: [{ text: prompt }] }],
         generationConfig: {
           responseMimeType: 'application/json',
-          responseSchema: TRANSLATE_SCHEMA,
+          responseSchema: schema,
           maxOutputTokens: 65535,
           thinkingConfig: { thinkingBudget: 0 },
         },
       }),
     }),
     onProgress,
-    `翻譯成 ${label} 中…`
+    progressMsg
   );
   const data = await res.json();
-  const out =
-    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
-    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  const cand = data && data.candidates && data.candidates[0];
+  const out = cand && cand.content && cand.content.parts && cand.content.parts[0] && cand.content.parts[0].text;
   if (!out) throw new Error('未取得翻譯結果，請重試。');
-  const r = JSON.parse(out);
+  try {
+    return JSON.parse(out);
+  } catch (_) {
+    throw new Error('翻譯結果解析失敗，請重試。');
+  }
+}
+
+export async function translateMeeting(transcript, summary, targetLang, apiKeys, opts = {}) {
+  const onProgress = opts.onProgress;
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+  const label = LANG_LABEL[targetLang] || targetLang;
+  report(onProgress, 'model', 3, '選擇型號中…');
+  const model = await resolveModel(kos[0].key, { preferLite: false }); // 翻譯固定用品質模型
+  const variants = kos.map((k) => ({ key: k.key, name: k.name }));
+
+  // 1) 摘要（小，一次）
+  const sumOut = await translatePayload(
+    variants,
+    model,
+    label,
+    {
+      actionItems: (summary && summary.actionItems) || [],
+      mainPoints: (summary && (summary.mainPoints || summary.keyPoints)) || [],
+      qa: (summary && summary.qa) || [],
+    },
+    SUMMARY_TR_SCHEMA,
+    onProgress,
+    `翻譯摘要成 ${label}…`
+  );
+
+  // 2) 逐字稿（分批，避免長逐字稿超過輸出上限被截斷）
+  const segs = transcript || [];
+  const BATCH = 60;
+  const nb = Math.max(1, Math.ceil(segs.length / BATCH));
+  const outSegs = [];
+  for (let i = 0; i < segs.length; i += BATCH) {
+    const batch = segs.slice(i, i + BATCH);
+    const r = await translatePayload(
+      variants,
+      model,
+      label,
+      { segments: batch },
+      SEG_SCHEMA,
+      onProgress,
+      `翻譯逐字稿成 ${label}…（${Math.floor(i / BATCH) + 1}/${nb}）`
+    );
+    outSegs.push(...(r.segments || []));
+  }
+
   return {
-    transcript: r.segments || [],
-    summary: { actionItems: r.actionItems || [], mainPoints: r.mainPoints || [], qa: r.qa || [] },
+    transcript: outSegs,
+    summary: { actionItems: sumOut.actionItems || [], mainPoints: sumOut.mainPoints || [], qa: sumOut.qa || [] },
   };
 }
