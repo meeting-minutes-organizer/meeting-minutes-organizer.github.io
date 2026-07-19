@@ -427,10 +427,68 @@ const SUMMARY_SCHEMA = {
   required: ['actionItems', 'mainPoints', 'qa'],
 };
 const SUMMARY_PROMPT =
-  `以下是一段會議逐字稿。請依內容整理成三類（全部使用繁體中文）：\n` +
-  `- actionItems（待辦事項）：逐條列出，每項結尾標註「[DRI: 負責人]」，判斷不出負責人就寫「[DRI: 待指派]」。\n` +
+  `以下是一段會議逐字稿。請依內容整理成三類，並使用「與逐字稿相同的主要語言」` +
+  `（逐字稿主要是中文就用繁體中文、主要是英文就用英文、主要是日文就用日文）：\n` +
+  `- actionItems（待辦事項）：逐條列出，每項結尾標註「[DRI: 負責人]」，判斷不出負責人就寫「[DRI: 待指派]」（英文用 [DRI: TBD]）。\n` +
   `- mainPoints（會議重點）：逐條列出。\n` +
-  `- qa（提問／Q&A）：格式「問：… 答：…」，若沒有問答就回傳空陣列。\n\n逐字稿：\n`;
+  `- qa（提問／Q&A）：格式「問：… 答：…」（英文用「Q: … A: …」），若沒有問答就回傳空陣列。\n\n逐字稿：\n`;
+
+// 加強單一區塊：分段掃過整份逐字稿，抓出「完整、不遺漏」的清單（解決 Q&A 只有幾筆的問題）
+const SECTION_META = {
+  actionItems: {
+    label: '待辦事項',
+    instr: '逐條列出「所有」待辦／後續行動（action items），不要精簡、不要遺漏；每項結尾標「[DRI: 負責人]」，判斷不出就標「[DRI: 待指派]」（英文用 [DRI: TBD]）',
+  },
+  mainPoints: { label: '會議重點', instr: '逐條列出「所有」重要重點與結論，力求完整、不要精簡' },
+  qa: {
+    label: '會議提問 Q&A',
+    instr: '把逐字稿中「每一組」提問與回答都抓出來（務必全部、不要只挑幾個），格式「問：… 答：…」（英文用「Q: … A: …」）',
+  },
+};
+const ITEMS_SCHEMA = { type: 'object', properties: { items: { type: 'array', items: { type: 'string' } } }, required: ['items'] };
+
+export async function enhanceSection(segments, section, apiKeys, opts = {}) {
+  const onProgress = opts.onProgress;
+  const meta = SECTION_META[section];
+  if (!meta) throw new Error('未知的區塊');
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+  report(onProgress, 'model', 3, '選擇型號中…');
+  const model = await resolveModel(kos.map((k) => k.key), { preferLite: false }); // 加強固定用品質模型
+  const variants = kos.map((k) => ({ key: k.key, name: k.name }));
+  const segs = segments || [];
+  const BATCH = 80;
+  const nb = Math.max(1, Math.ceil(segs.length / BATCH));
+  const all = [];
+  for (let i = 0; i < segs.length; i += BATCH) {
+    const text = segs.slice(i, i + BATCH).map((s) => `${s.speaker}：${s.text}`).join('\n');
+    const prompt =
+      `以下是一段會議逐字稿。請${meta.instr}。使用與逐字稿相同的主要語言。務求完整、不要遺漏、不要精簡。` +
+      `若這段沒有相關內容就回傳空陣列。只輸出 JSON {"items":[...]}。\n\n逐字稿：\n` +
+      text;
+    const res = await postJsonRotating(
+      variants,
+      (v) => ({
+        url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: 'application/json', responseSchema: ITEMS_SCHEMA, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
+        }),
+      }),
+      onProgress,
+      `加強${meta.label}中…（${Math.floor(i / BATCH) + 1}/${nb}）`
+    );
+    const data = await res.json();
+    const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    if (out) {
+      try {
+        const r = JSON.parse(out);
+        if (Array.isArray(r.items)) all.push(...r.items);
+      } catch (_) {}
+    }
+  }
+  return all;
+}
 
 export async function regenerateSummary(segments, apiKeys, opts = {}) {
   const onProgress = opts.onProgress;

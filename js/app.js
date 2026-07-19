@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, regenerateSummary, pickModelForKeys, uploadBlobToKeys, setPreferLite } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, regenerateSummary, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection } from './gemini.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
@@ -9,7 +9,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v31';
+const APP_VERSION = 'v32';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -561,10 +561,16 @@ async function renderDetail(id) {
         <button data-l="en">English</button>
         <button data-l="ja">日本語</button>
       </div>
-      <button class="big" id="shareBtn" style="margin-top:12px">📤 分享待辦與重點</button>
-      <div class="export-row">
-        <button class="btn-export" id="pdfBtn">📄 匯出 PDF</button>
-        <button class="btn-export" id="wordBtn">📝 匯出 Word (docx)</button>
+      <div class="act-grid">
+        <button class="act-btn primary" id="shareBtn">📤 分享</button>
+        <button class="act-btn" id="pdfBtn">📄 PDF</button>
+        <button class="act-btn" id="wordBtn">📝 Word</button>
+      </div>
+      <div class="act-grid">
+        <button class="act-btn" id="regenBtn">🔄 重整摘要</button>
+        <button class="act-btn" data-enh="actionItems">✅ 加強待辦</button>
+        <button class="act-btn" data-enh="mainPoints">📌 加強重點</button>
+        <button class="act-btn" data-enh="qa">❓ 加強Q&A</button>
       </div>
     </div>
     <div id="detailBody"></div>
@@ -602,7 +608,6 @@ async function renderDetail(id) {
         ${olHtml(mainPoints)}
         <div class="section-title">❓ 會議提問 Q&amp;A <button class="copy" data-copy="qa">複製</button></div>
         ${qaHtml(qa)}
-        ${isZh ? '<button class="btn-regen" id="regenBtn">🔄 重新整理摘要（用逐字稿重跑，不需重傳音檔）</button>' : ''}
       </div>
       <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
       ${chipsHtml ? `<div class="hint" style="margin:0 4px 6px">點下方語者可改名（例如「說話者1」→「陳經理」）</div>${chipsHtml}` : ''}
@@ -623,8 +628,6 @@ async function renderDetail(id) {
     });
 
     if (isZh) {
-      const rb = document.getElementById('regenBtn');
-      if (rb) rb.onclick = doRegen;
       bodyEl.querySelectorAll('.spk-chip').forEach((chip) => {
         chip.onclick = async () => {
           const cur = chip.dataset.spk;
@@ -719,6 +722,42 @@ async function renderDetail(id) {
 
   document.getElementById('pdfBtn').onclick = () => exportPdf(viewMeeting());
   document.getElementById('wordBtn').onclick = () => exportWord(viewMeeting());
+  document.getElementById('regenBtn').onclick = doRegen;
+
+  // 加強某一區塊（分段掃整份逐字稿抓完整清單）
+  const doEnhance = async (section, btn) => {
+    if (!hasApiKey()) {
+      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
+      return;
+    }
+    if (!(m.transcript && m.transcript.length)) {
+      alert('這場沒有逐字稿，無法加強');
+      return;
+    }
+    const nameMap = { actionItems: '待辦事項', mainPoints: '會議重點', qa: '會議提問 Q&A' };
+    if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區的內容（其他區不變）。`)) return;
+    const old = btn.textContent;
+    document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = true));
+    try {
+      const items = await enhanceSection(m.transcript, section, getApiKeyEntries(), {
+        onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '處理中…')),
+      });
+      m.summary = m.summary || {};
+      m.summary[section] = items;
+      m.translations = {}; // 內容改了 → 清掉舊翻譯
+      m.updatedAt = Date.now();
+      await save(m);
+      syncNow();
+      renderDetail(id);
+      toast(`已加強${nameMap[section]}（共 ${items.length} 筆）`);
+    } catch (e) {
+      alert('加強失敗：' + (e && e.message ? e.message : e));
+      document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = false));
+      btn.textContent = old;
+    }
+  };
+  document.querySelectorAll('[data-enh]').forEach((b) => (b.onclick = () => doEnhance(b.dataset.enh, b)));
+
   document.getElementById('shareBtn').onclick = async () => {
     const v = viewMeeting();
     const s = v.summary || {};
