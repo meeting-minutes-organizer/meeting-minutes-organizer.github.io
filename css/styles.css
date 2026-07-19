@@ -172,6 +172,15 @@ ol.list.qa li { margin: 10px 0; }
 .sheet-btn.cancel { text-align: center; color: var(--muted); background: transparent; }
 .sheet-btn:active { transform: scale(0.99); }
 
+/* ---- 區塊摺疊 + 條目跳出處 ---- */
+.sec-head { cursor: pointer; user-select: none; -webkit-user-select: none; }
+.sec-head .sec-t { flex: 1 1 auto; }
+.sec-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+.chev { color: var(--muted); font-size: 13px; width: 16px; text-align: center; }
+ol.list li[data-jump] { cursor: pointer; }
+ol.list li[data-jump]:active { color: var(--brand); }
+.seg.flash { background: color-mix(in srgb, var(--brand) 20%, transparent); border-radius: 8px; transition: background 1.4s ease; }
+
 /* ---- 逐字稿段落編輯 ---- */
 .seg[data-i] { cursor: pointer; border-radius: 8px; }
 .seg[data-i]:active { background: color-mix(in srgb, var(--brand) 8%, transparent); }

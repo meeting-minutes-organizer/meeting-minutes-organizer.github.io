@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v35';
+const APP_VERSION = 'v36';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -42,6 +42,36 @@ function setHeader(text, showBack, showBackup) {
   backupBtn.hidden = !showBackup;
   backBtn.onclick = () => (location.hash = '#/'); // 預設返回清單，個別頁面可覆寫
 }
+// 找出「這條摘要最可能出自哪一段逐字稿」：用字元二字組（bigram）重疊評分，免 API、即時
+export function bestSegIndex(text, transcript) {
+  const clean = (s) =>
+    String(s == null ? '' : s)
+      .replace(/\[DRI:[^\]]*\]/g, '')
+      .replace(/^問：|^答：|^Q:\s*|^A:\s*/g, '')
+      .toLowerCase();
+  const t = clean(text);
+  const grams = new Set();
+  for (let i = 0; i < t.length - 1; i++) {
+    const g = t.slice(i, i + 2);
+    if (/\S\S/.test(g)) grams.add(g);
+  }
+  if (!grams.size) return -1;
+  let best = -1;
+  let bestScore = 0;
+  (transcript || []).forEach((seg, i) => {
+    const st = clean((seg.speaker || '') + (seg.text || ''));
+    let score = 0;
+    grams.forEach((g) => {
+      if (st.includes(g)) score++;
+    });
+    if (score > bestScore) {
+      bestScore = score;
+      best = i;
+    }
+  });
+  return bestScore >= 2 ? best : -1;
+}
+
 function speakerColors(segments) {
   const map = {};
   let i = 0;
@@ -662,16 +692,16 @@ async function renderDetail(id) {
   setHeader('會議詳情', true);
   let lang = 'orig';
 
-  const olHtml = (arr) =>
+  const olHtml = (arr, key) =>
     arr && arr.length
-      ? `<ol class="list">${arr.map((x) => `<li>${esc(x)}</li>`).join('')}</ol>`
+      ? `<ol class="list">${arr.map((x, i) => `<li data-jump="${key}:${i}">${esc(x)}</li>`).join('')}</ol>`
       : `<div class="meta" style="padding-left:4px">（無）</div>`;
   const qaHtml = (arr) =>
     arr && arr.length
       ? `<ol class="list qa">${arr
-          .map((x) => {
+          .map((x, i) => {
             const { q, a } = splitQA(x);
-            return `<li><div class="qa-q"><b>問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b>答：</b>${esc(a)}</div>` : ''}</li>`;
+            return `<li data-jump="qa:${i}"><div class="qa-q"><b>問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b>答：</b>${esc(a)}</div>` : ''}</li>`;
           })
           .join('')}</ol>`
       : `<div class="meta" style="padding-left:4px">無</div>`;
@@ -737,7 +767,7 @@ async function renderDetail(id) {
     const colors = speakerColors(c.transcript);
     const isOrig = l === 'orig';
     const segHtml = (c.transcript || [])
-      .map((seg, i) => `<div class="seg"${isOrig ? ` data-i="${i}"` : ''}><span class="spk" style="color:${colors[seg.speaker] || 'var(--ink)'}">${esc(seg.speaker)}</span>${esc(seg.text)}</div>`)
+      .map((seg, i) => `<div class="seg" data-seg="${i}"${isOrig ? ` data-i="${i}"` : ''}><span class="spk" style="color:${colors[seg.speaker] || 'var(--ink)'}">${esc(seg.speaker)}</span>${esc(seg.text)}</div>`)
       .join('');
     const speakers = Object.keys(colors);
     const chipsHtml =
@@ -746,19 +776,76 @@ async function renderDetail(id) {
             .map((sp) => `<button class="spk-chip" data-spk="${esc(sp)}" style="color:${colors[sp]};border-color:${colors[sp]}">✎ ${esc(sp)}</button>`)
             .join('')}</div>`
         : '';
+    // 摺疊狀態（跨會議記住偏好）
+    const COLL_KEY = 'sec_collapsed';
+    const getColl = () => {
+      try {
+        return JSON.parse(localStorage.getItem(COLL_KEY)) || {};
+      } catch (_) {
+        return {};
+      }
+    };
+    const setCollapsed = (k, v) => {
+      const cc = getColl();
+      cc[k] = v ? 1 : 0;
+      localStorage.setItem(COLL_KEY, JSON.stringify(cc));
+      const b = bodyEl.querySelector(`[data-secbody="${k}"]`);
+      const ch = bodyEl.querySelector(`.sec-head[data-sec="${k}"] .chev`);
+      if (b) b.hidden = !!v;
+      if (ch) ch.textContent = v ? '▸' : '▾';
+    };
+    const coll = getColl();
+    const secHead = (k, title, copyKey, extra) =>
+      `<div class="section-title sec-head" data-sec="${k}"${extra ? ` style="${extra}"` : ''}><span class="sec-t">${title}</span><span class="sec-right"><button class="copy" data-copy="${copyKey}">複製</button><span class="chev">${coll[k] ? '▸' : '▾'}</span></span></div>`;
+
     bodyEl.innerHTML = `
       <div class="card">
-        <div class="section-title" style="margin-top:0">✅ 待辦事項 Action Item <button class="copy" data-copy="ai">複製</button></div>
-        ${olHtml(actionItems)}
-        <div class="section-title">📌 會議重點 Main Point <button class="copy" data-copy="mp">複製</button></div>
-        ${olHtml(mainPoints)}
-        <div class="section-title">❓ 會議提問 Q&amp;A <button class="copy" data-copy="qa">複製</button></div>
-        ${qaHtml(qa)}
+        ${secHead('ai', '✅ 待辦事項 Action Item', 'ai', 'margin-top:0')}
+        <div class="sec-body" data-secbody="ai"${coll.ai ? ' hidden' : ''}>${olHtml(actionItems, 'ai')}</div>
+        ${secHead('mp', '📌 會議重點 Main Point', 'mp')}
+        <div class="sec-body" data-secbody="mp"${coll.mp ? ' hidden' : ''}>${olHtml(mainPoints, 'mp')}</div>
+        ${secHead('qa', '❓ 會議提問 Q&amp;A', 'qa')}
+        <div class="sec-body" data-secbody="qa"${coll.qa ? ' hidden' : ''}>${qaHtml(qa)}</div>
+        <div class="hint" style="margin-top:10px">點各區標題可摺疊／展開；<b>點任一條內容</b>可跳到它在逐字稿中的出處</div>
       </div>
-      <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
-      ${isOrig ? `<div class="hint" style="margin:0 4px 6px">點語者可改名；<b>點段落文字可直接修改錯字</b></div>` : ''}
-      ${chipsHtml || ''}
-      <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>`;
+      ${secHead('tr', '🗣️ 逐字稿', 'tr')}
+      <div class="sec-body" data-secbody="tr"${coll.tr ? ' hidden' : ''}>
+        ${isOrig ? `<div class="hint" style="margin:0 4px 6px">點語者可改名；<b>點段落文字可直接修改錯字</b></div>` : ''}
+        ${chipsHtml || ''}
+        <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>
+      </div>`;
+
+    // 摺疊/展開（點「複製」不觸發）
+    bodyEl.querySelectorAll('.sec-head').forEach((h) => {
+      h.onclick = (e) => {
+        if (e.target.closest('.copy')) return;
+        const k = h.dataset.sec;
+        setCollapsed(k, !getColl()[k]);
+      };
+    });
+
+    // 點摘要條目 → 跳到逐字稿出處（本機文字比對，不耗額度）
+    const jumpTo = (idx) => {
+      setCollapsed('tr', false);
+      const target = bodyEl.querySelector(`.seg[data-seg="${idx}"]`);
+      if (!target) return;
+      if (target.scrollIntoView) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      target.classList.add('flash');
+      setTimeout(() => target.classList.remove('flash'), 2400);
+    };
+    const arrMap = { ai: actionItems, mp: mainPoints, qa };
+    bodyEl.querySelectorAll('[data-jump]').forEach((li) => {
+      li.onclick = () => {
+        const [k, iStr] = li.dataset.jump.split(':');
+        const itemText = (arrMap[k] || [])[+iStr] || '';
+        const idx = bestSegIndex(itemText, c.transcript || []);
+        if (idx < 0) {
+          toast('找不到明確的逐字稿出處');
+          return;
+        }
+        jumpTo(idx);
+      };
+    });
 
     const texts = { ai: numbered(actionItems), mp: numbered(mainPoints), qa: qaText(qa), tr: transcriptToText(c.transcript) };
     bodyEl.querySelectorAll('.copy').forEach((b) => {
