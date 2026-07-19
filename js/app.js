@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v37';
+const APP_VERSION = 'v38';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1017,12 +1017,33 @@ async function renderDetail(id) {
   // 問答：把逐字稿+問題丟給品質模型回答，紀錄存在這場會議
   const chatLogEl = document.getElementById('chatLog');
   const chatClearBtn = document.getElementById('chatClear');
+  const fmtAnswer = (a) =>
+    esc(a)
+      .replace(/\*\*([^*\n]+)\*\*/g, '<b>$1</b>') // AI 偶爾用 **粗體**，正確顯示
+      .replace(/\n/g, '<br>');
   const drawChat = () => {
     const items = m.chat || [];
     chatLogEl.innerHTML = items
-      .map((c) => `<div class="chat-q">🙋 ${esc(c.q)}</div><div class="chat-a">${esc(c.a).replace(/\n/g, '<br>')}</div>`)
+      .map(
+        (c, i) =>
+          `<div class="chat-q">🙋 ${esc(c.q)}</div>
+           <div class="chat-a">${fmtAnswer(c.a)}<div class="chat-ops"><button class="copy chat-copy" data-ci="${i}">複製回答</button></div></div>`
+      )
       .join('');
     chatClearBtn.hidden = !items.length;
+    chatLogEl.querySelectorAll('.chat-copy').forEach((b) => {
+      b.onclick = async () => {
+        const it = (m.chat || [])[+b.dataset.ci];
+        if (!it) return;
+        try {
+          await navigator.clipboard.writeText(it.a);
+          b.textContent = '已複製 ✓';
+          setTimeout(() => (b.textContent = '複製回答'), 1200);
+        } catch (_) {
+          alert('複製失敗，請長按文字手動選取');
+        }
+      };
+    });
   };
   drawChat();
   chatClearBtn.onclick = async () => {

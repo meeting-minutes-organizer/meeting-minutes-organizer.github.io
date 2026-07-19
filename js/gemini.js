@@ -503,7 +503,7 @@ export async function askMeeting(transcript, summary, question, apiKeys, opts = 
   const prompt =
     `你是會議記錄助理。請「只根據」下方會議逐字稿與摘要回答使用者的問題；` +
     `會議中沒有提到的就明白說「會議中沒有提到」，不要自行編造。` +
-    `用使用者提問的語言回答，精簡、必要時分點。\n\n` +
+    `用使用者提問的語言回答，精簡、必要時分點。用純文字回答，不要使用 Markdown 符號（如 ** 或 #）。\n\n` +
     `【摘要】\n待辦：${(s.actionItems || []).join('；') || '（無）'}\n` +
     `重點：${(s.mainPoints || s.keyPoints || []).join('；') || '（無）'}\n\n` +
     `【逐字稿】\n${text}\n\n【使用者的問題】${question}`;

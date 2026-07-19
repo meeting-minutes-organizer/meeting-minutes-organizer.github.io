@@ -19,7 +19,8 @@ body {
   background: var(--bg);
   color: var(--ink);
   min-height: 100vh;
-  padding: env(safe-area-inset-top) env(safe-area-inset-right) 0 env(safe-area-inset-left);
+  /* 上方安全區改由 .topbar 自己處理（sticky 捲動時才不會蓋到狀態列） */
+  padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left);
   -webkit-text-size-adjust: 100%;
   /* 原生手感：禁止長按選單、禁止整頁彈跳 */
   -webkit-touch-callout: none;
@@ -28,7 +29,7 @@ body {
   user-select: none;
 }
 /* 內容區允許選取（方便手動複製） */
-input, .transcript-box, ol.list, ul.list, pre.transcript {
+input, textarea, .transcript-box, ol.list, ul.list, pre.transcript, .chat-a {
   -webkit-user-select: text;
   user-select: text;
 }
@@ -60,11 +61,21 @@ button:active { transform: scale(0.97); }
 .topbar {
   position: sticky; top: 0; z-index: 10;
   display: flex; align-items: center; gap: 8px;
-  padding: 10px 12px; background: color-mix(in srgb, var(--bg) 85%, transparent);
-  backdrop-filter: saturate(180%) blur(12px);
+  /* 安全區留白放在頂欄內：捲動時整條（含毛玻璃底）蓋住狀態列區，按鈕永遠在可點位置 */
+  padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
+  background: color-mix(in srgb, var(--bg) 88%, transparent);
+  backdrop-filter: saturate(180%) blur(14px);
+  -webkit-backdrop-filter: saturate(180%) blur(14px);
 }
-.topbar h1 { flex: 1; font-size: 17px; font-weight: 600; margin: 0; text-align: center; }
-.ghost { background: none; border: none; font-size: 16px; color: var(--brand); padding: 8px; min-width: 44px; }
+.topbar h1 { flex: 1; font-size: 17px; font-weight: 600; margin: 0; text-align: center; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+/* 頂欄按鈕：加大成一眼看得到、好按的圓鈕（44px 是 iOS 建議的最小觸控尺寸） */
+.ghost {
+  flex: 0 0 auto; background: var(--btn2); border: none; color: var(--brand);
+  width: 44px; height: 44px; border-radius: 50%; font-size: 20px; font-weight: 600;
+  display: flex; align-items: center; justify-content: center; padding: 0;
+  box-shadow: 0 1px 2px rgba(0, 0, 0, 0.1);
+}
+#backBtn { width: auto; padding: 0 14px 0 10px; border-radius: 22px; font-size: 16px; }
 main { padding: 8px 16px 100px; max-width: 720px; margin: 0 auto; }
 .card {
   background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 12px;
@@ -192,6 +203,7 @@ textarea.seg-edit { width: 100%; margin-top: 6px; padding: 10px; border: 1.5px s
 #chatInput { width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 10px; font-size: 15px; line-height: 1.5; background: var(--bg); color: var(--ink); font-family: inherit; }
 .chat-q { font-weight: 700; margin: 12px 0 4px; line-height: 1.5; }
 .chat-a { background: var(--bg); border-radius: 10px; padding: 10px 12px; line-height: 1.7; font-size: 15px; margin-bottom: 4px; white-space: normal; }
+.chat-ops { display: flex; justify-content: flex-end; margin-top: 8px; }
 #chatLog { margin-bottom: 10px; }
 .warn { background: color-mix(in srgb, #ff9500 15%, var(--card)); border-radius: 10px; padding: 10px 12px; font-size: 13px; line-height: 1.6; margin-top: 10px; }
 .err { color: var(--danger); }
