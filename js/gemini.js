@@ -48,14 +48,41 @@ export function pickModel(models, opts = {}) {
   return scored.length ? scored[0].name : null;
 }
 
+// 查型號結果快取（依 preferLite 分開），避免每次都打 ListModels、也避免單把金鑰冷卻就整個失敗
+const modelCache = {};
+export function clearModelCache() {
+  for (const k in modelCache) delete modelCache[k];
+}
+// apiKeys 可為單把字串或多把陣列 → 多把時逐把嘗試查型號（某把冷卻/失敗會換下一把）
 // opts.preferLite: 明確指定要不要用 Flash-Lite（辨識用全域設定；摘要/翻譯固定 false 品質優先）
-async function resolveModel(apiKey, opts = {}) {
-  const res = await fetch(`${BASE}/v1beta/models?key=${apiKey}`);
-  if (!res.ok) throw new Error(`取得可用型號失敗 (${res.status})：${(await res.text()).slice(0, 200)}`);
-  const data = await res.json();
-  const name = pickModel(data.models || [], { preferLite: opts.preferLite != null ? opts.preferLite : preferLite });
-  if (!name) throw new Error('這組金鑰找不到可用的辨識型號，請確認金鑰是否正確、或是否已啟用 Gemini API。');
-  return name;
+async function resolveModel(apiKeys, opts = {}) {
+  const lite = opts.preferLite != null ? opts.preferLite : preferLite;
+  const ck = String(lite);
+  if (modelCache[ck]) return modelCache[ck];
+  const keys = (Array.isArray(apiKeys) ? apiKeys : [apiKeys]).filter(Boolean);
+  if (!keys.length) throw new Error('尚未設定 API 金鑰');
+  let lastErr = null;
+  for (const key of keys) {
+    let res;
+    try {
+      res = await fetch(`${BASE}/v1beta/models?key=${key}`);
+    } catch (e) {
+      lastErr = new Error('網路連線失敗，請確認網路。');
+      continue;
+    }
+    if (!res.ok) {
+      lastErr = new Error(`取得可用型號失敗 (${res.status})：${(await res.text()).slice(0, 150)}`);
+      continue;
+    }
+    const data = await res.json();
+    const name = pickModel(data.models || [], { preferLite: lite });
+    if (name) {
+      modelCache[ck] = name;
+      return name;
+    }
+    lastErr = new Error('這組金鑰找不到可用型號，請確認金鑰是否正確、或是否已啟用 Gemini API。');
+  }
+  throw lastErr || new Error('取得可用型號失敗');
 }
 
 
@@ -335,7 +362,7 @@ export async function uploadForJob(file, apiKeys, onProgress) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
   report(onProgress, 'model', 3, '選擇辨識型號中…');
-  const model = await resolveModel(kos[0].key);
+  const model = await resolveModel(kos.map((k) => k.key));
   const uploads = [];
   let mime = file.type || 'audio/mpeg';
   for (let i = 0; i < kos.length; i++) {
@@ -356,7 +383,7 @@ export function transcribeRange(uploads, mime, model, start, end, whole, onProgr
 export async function pickModelForKeys(apiKeys, opts = {}) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
-  return resolveModel(kos[0].key, opts);
+  return resolveModel(kos.map((k) => k.key), opts);
 }
 // 把一個音檔（Blob/File）上傳到每一把金鑰的專案，回傳 { uploads:[{key,name,fileUri}], mime }
 export async function uploadBlobToKeys(blob, apiKeys, onProgress) {
@@ -410,7 +437,7 @@ export async function regenerateSummary(segments, apiKeys, opts = {}) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
   report(onProgress, 'model', 3, '選擇型號中…');
-  const model = await resolveModel(kos[0].key, { preferLite: false }); // 摘要固定用品質模型
+  const model = await resolveModel(kos.map((k) => k.key), { preferLite: false }); // 摘要固定用品質模型
   return summarizeSegments(segments, kos, model, onProgress);
 }
 
@@ -467,7 +494,7 @@ export async function translateMeeting(transcript, summary, targetLang, apiKeys,
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
   const label = LANG_LABEL[targetLang] || targetLang;
   report(onProgress, 'model', 3, '選擇型號中…');
-  const model = await resolveModel(kos[0].key, { preferLite: false }); // 翻譯固定用品質模型
+  const model = await resolveModel(kos.map((k) => k.key), { preferLite: false }); // 翻譯固定用品質模型
   const variants = kos.map((k) => ({ key: k.key, name: k.name }));
 
   // 1) 摘要（小，一次）

@@ -9,7 +9,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v30';
+const APP_VERSION = 'v31';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -679,12 +679,12 @@ async function renderDetail(id) {
   const setLang = async (l) => {
     document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === l));
     if (l !== 'zh' && !contentFor(l)) {
+      lang = l;
       if (!hasApiKey()) {
-        alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
-        document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === 'zh'));
+        bodyEl.innerHTML = `<div class="card"><div class="err">請先到右上角 ⚙︎ 設定，填入你的 Gemini API 金鑰，才能翻譯。<br>（金鑰是每台裝置各自設定的）</div><button class="big secondary" id="backZh" style="margin-top:10px">返回中文</button></div>`;
+        document.getElementById('backZh').onclick = () => setLang('zh');
         return;
       }
-      lang = l;
       drawBody(l); // 顯示「翻譯中…」
       try {
         const tr = await translateMeeting(m.transcript, m.summary, l, getApiKeyEntries(), {
@@ -700,9 +700,15 @@ async function renderDetail(id) {
         syncNow();
         if (lang === l) drawBody(l);
       } catch (e) {
-        alert('翻譯失敗：' + (e && e.message ? e.message : e));
-        lang = 'zh';
-        setLang('zh');
+        if (lang !== l) return; // 使用者已切走
+        bodyEl.innerHTML = `<div class="card"><div class="err">❌ 翻譯失敗：${esc(e && e.message ? e.message : e)}</div>
+          <button class="big" id="retryTr" style="margin-top:10px">重試翻譯</button>
+          <button class="big secondary" id="backZh" style="margin-top:8px">返回中文</button></div>`;
+        document.getElementById('retryTr').onclick = () => {
+          if (m.translations) delete m.translations[l];
+          setLang(l);
+        };
+        document.getElementById('backZh').onclick = () => setLang('zh');
       }
     } else {
       lang = l;
