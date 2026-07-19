@@ -1,7 +1,8 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting } from './gemini.js';
+import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, addGroup, renameGroup, removeGroup, groupName } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
@@ -9,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v34';
+const APP_VERSION = 'v35';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -20,6 +21,8 @@ const backBtn = document.getElementById('backBtn');
 const backupBtn = document.getElementById('backupBtn');
 
 document.getElementById('homeTab').onclick = () => (location.hash = '#/');
+const groupsTabEl = document.getElementById('groupsTab');
+if (groupsTabEl) groupsTabEl.onclick = () => (location.hash = '#/groups');
 document.getElementById('newTab').onclick = () => (location.hash = '#/new');
 document.getElementById('settingsBtn').onclick = () => (location.hash = '#/settings');
 backBtn.onclick = () => (location.hash = '#/');
@@ -37,6 +40,7 @@ function setHeader(text, showBack, showBackup) {
   titleEl.textContent = text;
   backBtn.hidden = !showBack;
   backupBtn.hidden = !showBackup;
+  backBtn.onclick = () => (location.hash = '#/'); // 預設返回清單，個別頁面可覆寫
 }
 function speakerColors(segments) {
   const map = {};
@@ -83,16 +87,28 @@ async function syncNow(silent) {
   syncing = true;
   try {
     if (!silent) toast('雲端同步中…');
+    const localState = async () => ({
+      meetings: await list(),
+      deleted: getTombstones(),
+      groups: getGroups(),
+      groupsDeleted: getGroupTombstones(),
+    });
+    const applyGroups = (merged) => {
+      setGroups(merged.groups || []);
+      setGroupTombstones(merged.groupsDeleted || []);
+    };
     let remote = await sync.pull();
-    let merged = mergeState({ meetings: await list(), deleted: getTombstones() }, remote.doc);
+    let merged = mergeState(await localState(), remote.doc);
     await applyMerged(merged);
+    applyGroups(merged);
     try {
       await sync.push(merged, remote.sha);
     } catch (e) {
       if (e.message === 'CONFLICT') {
         remote = await sync.pull();
-        merged = mergeState({ meetings: await list(), deleted: getTombstones() }, remote.doc);
+        merged = mergeState(await localState(), remote.doc);
         await applyMerged(merged);
+        applyGroups(merged);
         await sync.push(merged, remote.sha);
       } else {
         throw e;
@@ -106,18 +122,68 @@ async function syncNow(silent) {
   }
 }
 
-async function renderList() {
-  const meetings = await list();
-  setHeader('DD會議紀錄', false, meetings.length > 0);
+// 底部彈出的分類選單：回傳群組 id / null（移出分類）/ undefined（取消）
+function pickGroup(current) {
+  return new Promise((resolve) => {
+    const ov = document.createElement('div');
+    ov.className = 'sheet-ov';
+    const gs = getGroups();
+    ov.innerHTML = `<div class="sheet">
+      <div class="sheet-title">設定分類</div>
+      ${gs.map((g) => `<button class="sheet-btn${g.id === current ? ' cur' : ''}" data-g="${g.id}">📂 ${esc(g.name)}${g.id === current ? ' ✓' : ''}</button>`).join('')}
+      <button class="sheet-btn" data-g="__new">➕ 新增群組</button>
+      ${current ? '<button class="sheet-btn" data-g="__none">🚫 移出分類</button>' : ''}
+      <button class="sheet-btn cancel" data-g="__cancel">取消</button>
+    </div>`;
+    document.body.appendChild(ov);
+    const done = (v) => {
+      ov.remove();
+      resolve(v);
+    };
+    ov.onclick = (e) => {
+      if (e.target === ov) done(undefined);
+    };
+    ov.querySelectorAll('.sheet-btn').forEach((b) => {
+      b.onclick = () => {
+        const g = b.dataset.g;
+        if (g === '__cancel') return done(undefined);
+        if (g === '__none') return done(null);
+        if (g === '__new') {
+          const name = prompt('新群組名稱：');
+          if (!name || !name.trim()) return done(undefined);
+          const ng = addGroup(name);
+          return done(ng ? ng.id : undefined);
+        }
+        done(g);
+      };
+    });
+  });
+}
+
+// groupId：undefined = 全部；'__none' = 未分類；其他 = 該群組
+async function renderList(groupId) {
+  const all = await list();
+  const gs = getGroups();
+  const known = new Set(gs.map((g) => g.id));
+  const meetings =
+    groupId === '__none'
+      ? all.filter((m) => !m.group || !known.has(m.group))
+      : groupId
+        ? all.filter((m) => m.group === groupId)
+        : all;
+  const title = groupId === '__none' ? '🗂 未分類' : groupId ? `📂 ${groupName(groupId) || '分類'}` : 'DD會議紀錄';
+  setHeader(title, !!groupId, meetings.length > 0);
+  if (groupId) backBtn.onclick = () => (location.hash = '#/groups');
   if (!meetings.length) {
-    view.innerHTML = `<div class="empty">還沒有會議記錄<br>點下方「＋ 新增會議」上傳錄音檔</div>`;
+    view.innerHTML = `<div class="empty">${groupId ? '這個分類還沒有會議<br>到「清單」點會議卡片上的分類標籤加入' : '還沒有會議記錄<br>點下方「＋ 新增會議」上傳錄音檔'}</div>`;
     return;
   }
   const cardHtml = (m) => {
     const mp = (m.summary && (m.summary.mainPoints || m.summary.keyPoints)) || [];
     const snip = mp.length ? mp.join('、') : transcriptToText(m.transcript).slice(0, 60);
+    const gn = m.group && known.has(m.group) ? groupName(m.group) : '';
     return `<div class="card tap" data-id="${m.id}">
-        <h3>${esc(m.title)}</h3>
+        <div class="card-top"><h3>${esc(m.title)}</h3><button class="grp-chip${gn ? ' has' : ''}" type="button">📂 ${esc(gn || '未分類')}</button></div>
         <div class="meta">${formatDate(m.createdAt)}</div>
         <div class="snippet">${esc(snip)}</div>
       </div>`;
@@ -132,11 +198,84 @@ async function renderList() {
       : '<div class="empty">找不到符合的會議</div>';
     body.querySelectorAll('.card').forEach((c) => {
       c.onclick = () => (location.hash = '#/m/' + c.dataset.id);
+      const chip = c.querySelector('.grp-chip');
+      if (chip)
+        chip.onclick = async (e) => {
+          e.stopPropagation();
+          const m = meetings.find((x) => x.id === c.dataset.id);
+          if (!m) return;
+          const r = await pickGroup(m.group);
+          if (r === undefined) return;
+          if (r === null) delete m.group;
+          else m.group = r;
+          m.updatedAt = Date.now();
+          await save(m);
+          syncNow();
+          router();
+        };
     });
   };
   draw('');
   const si = document.getElementById('search');
   si.oninput = () => draw(si.value);
+}
+
+// 分類頁：群組清單（新增／改名／刪除／點入看該組會議）
+async function renderGroups() {
+  const meetings = await list();
+  setHeader('分類', false, false);
+  const gs = getGroups();
+  const known = new Set(gs.map((g) => g.id));
+  const count = (gid) => meetings.filter((m) => m.group === gid).length;
+  const unCount = meetings.filter((m) => !m.group || !known.has(m.group)).length;
+  view.innerHTML = `
+    <button class="big" id="addGroupBtn">➕ 新增群組</button>
+    <div id="groupList" style="margin-top:12px">
+      ${gs
+        .map(
+          (g) => `<div class="card tap" data-g="${g.id}">
+            <div class="card-top"><h3>📂 ${esc(g.name)}</h3>
+              <span class="grp-ops"><button class="grp-op g-edit" type="button" title="改名">✎</button><button class="grp-op g-del" type="button" title="刪除">🗑</button></span></div>
+            <div class="meta">${count(g.id)} 場會議</div>
+          </div>`
+        )
+        .join('')}
+      ${unCount ? `<div class="card tap" data-g="__none"><h3>🗂 未分類</h3><div class="meta">${unCount} 場會議</div></div>` : ''}
+      ${!gs.length && !unCount ? '<div class="empty">還沒有群組<br>點上方「＋ 新增群組」建立</div>' : ''}
+    </div>`;
+  document.getElementById('addGroupBtn').onclick = () => {
+    const name = prompt('新群組名稱：');
+    if (name && name.trim()) {
+      addGroup(name);
+      syncNow(true);
+      renderGroups();
+    }
+  };
+  view.querySelectorAll('#groupList .card').forEach((c) => {
+    c.onclick = () => (location.hash = '#/g/' + c.dataset.g);
+    const ed = c.querySelector('.g-edit');
+    const del = c.querySelector('.g-del');
+    if (ed)
+      ed.onclick = (e) => {
+        e.stopPropagation();
+        const g = gs.find((x) => x.id === c.dataset.g);
+        const nn = prompt('群組改名：', g ? g.name : '');
+        if (nn && nn.trim()) {
+          renameGroup(c.dataset.g, nn);
+          syncNow(true);
+          renderGroups();
+        }
+      };
+    if (del)
+      del.onclick = async (e) => {
+        e.stopPropagation();
+        const n = count(c.dataset.g);
+        if (!confirm(`刪除這個群組？${n ? `裡面的 ${n} 場會議不會被刪，會變成「未分類」。` : ''}`)) return;
+        removeGroup(c.dataset.g);
+        syncNow(true);
+        renderGroups();
+      };
+  });
 }
 
 async function onExport() {
@@ -574,6 +713,13 @@ async function renderDetail(id) {
       </div>
     </div>
     <div id="detailBody"></div>
+    <div class="card" id="chatCard">
+      <div class="section-title" style="margin-top:0">💬 問這場會議 <button class="copy" id="chatClear" hidden>清除紀錄</button></div>
+      <div id="chatLog"></div>
+      <textarea id="chatInput" rows="2" placeholder="輸入問題，例如：這場會議最後的結論是什麼？"></textarea>
+      <button class="big" id="chatAsk">送出問題</button>
+      <div class="hint">AI 只根據這場會議的逐字稿回答；問答會存在這場會議裡。</div>
+    </div>
     <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
 
   const bodyEl = document.getElementById('detailBody');
@@ -589,10 +735,10 @@ async function renderDetail(id) {
     const mainPoints = s.mainPoints || s.keyPoints || [];
     const qa = s.qa || [];
     const colors = speakerColors(c.transcript);
-    const segHtml = (c.transcript || [])
-      .map((seg) => `<div class="seg"><span class="spk" style="color:${colors[seg.speaker] || 'var(--ink)'}">${esc(seg.speaker)}</span>${esc(seg.text)}</div>`)
-      .join('');
     const isOrig = l === 'orig';
+    const segHtml = (c.transcript || [])
+      .map((seg, i) => `<div class="seg"${isOrig ? ` data-i="${i}"` : ''}><span class="spk" style="color:${colors[seg.speaker] || 'var(--ink)'}">${esc(seg.speaker)}</span>${esc(seg.text)}</div>`)
+      .join('');
     const speakers = Object.keys(colors);
     const chipsHtml =
       isOrig && speakers.length
@@ -610,7 +756,8 @@ async function renderDetail(id) {
         ${qaHtml(qa)}
       </div>
       <div class="section-title">🗣️ 逐字稿 <button class="copy" data-copy="tr">複製</button></div>
-      ${chipsHtml ? `<div class="hint" style="margin:0 4px 6px">點下方語者可改名（例如「說話者1」→「陳經理」）</div>${chipsHtml}` : ''}
+      ${isOrig ? `<div class="hint" style="margin:0 4px 6px">點語者可改名；<b>點段落文字可直接修改錯字</b></div>` : ''}
+      ${chipsHtml || ''}
       <div class="transcript-box">${segHtml || '<div class="meta">（無逐字稿）</div>'}</div>`;
 
     const texts = { ai: numbered(actionItems), mp: numbered(mainPoints), qa: qaText(qa), tr: transcriptToText(c.transcript) };
@@ -628,6 +775,38 @@ async function renderDetail(id) {
     });
 
     if (isOrig) {
+      // 點段落 → 直接編輯逐字稿文字
+      bodyEl.querySelectorAll('.seg[data-i]').forEach((el) => {
+        el.onclick = () => {
+          if (el.querySelector('textarea')) return; // 已在編輯中
+          const i = +el.dataset.i;
+          const seg = m.transcript[i];
+          if (!seg) return;
+          el.innerHTML = `<span class="spk" style="color:${colors[seg.speaker] || 'var(--ink)'}">${esc(seg.speaker)}</span>
+            <textarea class="seg-edit" rows="3"></textarea>
+            <div class="seg-edit-ops"><button class="act-btn primary seg-save" type="button">儲存</button><button class="act-btn seg-cancel" type="button">取消</button></div>`;
+          const ta = el.querySelector('textarea');
+          ta.value = seg.text;
+          ta.focus();
+          el.querySelector('.seg-cancel').onclick = (e) => {
+            e.stopPropagation();
+            drawBody('orig');
+          };
+          el.querySelector('.seg-save').onclick = async (e) => {
+            e.stopPropagation();
+            const nt = ta.value.trim();
+            if (nt && nt !== seg.text) {
+              seg.text = nt;
+              m.translations = {}; // 原文改了，清掉舊翻譯
+              m.updatedAt = Date.now();
+              await save(m);
+              syncNow();
+              toast('已修改 ✓');
+            }
+            drawBody('orig');
+          };
+        };
+      });
       bodyEl.querySelectorAll('.spk-chip').forEach((chip) => {
         chip.onclick = async () => {
           const cur = chip.dataset.spk;
@@ -745,6 +924,60 @@ async function renderDetail(id) {
       } catch (_) {
         alert(text);
       }
+    }
+  };
+
+  // 問答：把逐字稿+問題丟給品質模型回答，紀錄存在這場會議
+  const chatLogEl = document.getElementById('chatLog');
+  const chatClearBtn = document.getElementById('chatClear');
+  const drawChat = () => {
+    const items = m.chat || [];
+    chatLogEl.innerHTML = items
+      .map((c) => `<div class="chat-q">🙋 ${esc(c.q)}</div><div class="chat-a">${esc(c.a).replace(/\n/g, '<br>')}</div>`)
+      .join('');
+    chatClearBtn.hidden = !items.length;
+  };
+  drawChat();
+  chatClearBtn.onclick = async () => {
+    if (!confirm('清除這場會議的所有問答紀錄？')) return;
+    m.chat = [];
+    m.updatedAt = Date.now();
+    await save(m);
+    syncNow();
+    drawChat();
+  };
+  document.getElementById('chatAsk').onclick = async () => {
+    const inp = document.getElementById('chatInput');
+    const q = inp.value.trim();
+    if (!q) return;
+    if (!hasApiKey()) {
+      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
+      return;
+    }
+    if (!(m.transcript && m.transcript.length)) {
+      alert('這場沒有逐字稿，無法問答');
+      return;
+    }
+    const btn = document.getElementById('chatAsk');
+    btn.disabled = true;
+    btn.textContent = '⏳ 思考中…';
+    try {
+      const a = await askMeeting(m.transcript, m.summary, q, getApiKeyEntries(), {
+        onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '思考中…')),
+      });
+      m.chat = m.chat || [];
+      m.chat.push({ q, a, at: Date.now() });
+      m.updatedAt = Date.now();
+      await save(m);
+      syncNow();
+      inp.value = '';
+      drawChat();
+      chatLogEl.lastElementChild && chatLogEl.lastElementChild.scrollIntoView({ block: 'nearest' });
+    } catch (e) {
+      alert('問答失敗：' + (e && e.message ? e.message : e));
+    } finally {
+      btn.disabled = false;
+      btn.textContent = '送出問題';
     }
   };
 
@@ -905,6 +1138,8 @@ function router() {
   if (h.startsWith('#/m/')) return renderDetail(h.slice(4));
   if (h === '#/new') return renderNew();
   if (h === '#/settings') return renderSettings();
+  if (h === '#/groups') return renderGroups();
+  if (h.startsWith('#/g/')) return renderList(h.slice(4));
   return renderList();
 }
 window.addEventListener('hashchange', router);

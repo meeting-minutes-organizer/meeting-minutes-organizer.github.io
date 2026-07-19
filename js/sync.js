@@ -40,7 +40,17 @@ export function mergeState(a, b) {
     if (!prev || stamp(m) >= stamp(prev)) byId.set(m.id, m);
   }
   const meetings = Array.from(byId.values()).sort((x, y) => y.createdAt - x.createdAt);
-  return { meetings, deleted };
+  // 分類群組也一樣合併（墓碑 + updatedAt 較新者勝）
+  const groupsDeleted = Array.from(new Set([...(A.groupsDeleted || []), ...(B.groupsDeleted || [])]));
+  const gDelSet = new Set(groupsDeleted);
+  const gById = new Map();
+  for (const g of [...(A.groups || []), ...(B.groups || [])]) {
+    if (!g || !g.id || gDelSet.has(g.id)) continue;
+    const prev = gById.get(g.id);
+    if (!prev || stamp(g) >= stamp(prev)) gById.set(g.id, g);
+  }
+  const groups = Array.from(gById.values()).sort((x, y) => (x.createdAt || 0) - (y.createdAt || 0));
+  return { meetings, deleted, groups, groupsDeleted };
 }
 
 // ---- UTF-8 安全的 base64（處理中文與大檔）----
@@ -76,7 +86,7 @@ export async function pull() {
   const c = getSyncConfig();
   if (!c) throw new Error('尚未設定雲端同步');
   const res = await fetch(apiUrl(c), { headers: authHeaders(c) });
-  if (res.status === 404) return { doc: { meetings: [], deleted: [] }, sha: null };
+  if (res.status === 404) return { doc: { meetings: [], deleted: [], groups: [], groupsDeleted: [] }, sha: null };
   if (res.status === 401) throw new Error('GitHub 權杖無效或已過期');
   if (!res.ok) throw new Error(`雲端讀取失敗 (${res.status})`);
   const data = await res.json();
@@ -88,6 +98,8 @@ export async function pull() {
   }
   doc.meetings = doc.meetings || [];
   doc.deleted = doc.deleted || [];
+  doc.groups = doc.groups || [];
+  doc.groupsDeleted = doc.groupsDeleted || [];
   return { doc, sha: data.sha };
 }
 

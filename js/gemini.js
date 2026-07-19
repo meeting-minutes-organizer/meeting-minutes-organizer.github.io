@@ -490,6 +490,43 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
   return all;
 }
 
+// 問答：根據整份逐字稿+摘要回答使用者問題（純文字，固定品質模型）
+export async function askMeeting(transcript, summary, question, apiKeys, opts = {}) {
+  const onProgress = opts.onProgress;
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+  report(onProgress, 'model', 3, '選擇型號中…');
+  const model = await resolveModel(kos.map((k) => k.key), { preferLite: false }); // 問答固定用品質模型
+  const variants = kos.map((k) => ({ key: k.key, name: k.name }));
+  const s = summary || {};
+  const text = (transcript || []).map((seg) => `${seg.speaker}：${seg.text}`).join('\n');
+  const prompt =
+    `你是會議記錄助理。請「只根據」下方會議逐字稿與摘要回答使用者的問題；` +
+    `會議中沒有提到的就明白說「會議中沒有提到」，不要自行編造。` +
+    `用使用者提問的語言回答，精簡、必要時分點。\n\n` +
+    `【摘要】\n待辦：${(s.actionItems || []).join('；') || '（無）'}\n` +
+    `重點：${(s.mainPoints || s.keyPoints || []).join('；') || '（無）'}\n\n` +
+    `【逐字稿】\n${text}\n\n【使用者的問題】${question}`;
+  const res = await postJsonRotating(
+    variants,
+    (v) => ({
+      url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: prompt }] }],
+        generationConfig: { maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
+      }),
+    }),
+    onProgress,
+    '思考回答中…'
+  );
+  const data = await res.json();
+  const out =
+    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
+    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if (!out) throw new Error('未取得回答，請重試。');
+  return out.trim();
+}
+
 export async function regenerateSummary(segments, apiKeys, opts = {}) {
   const onProgress = opts.onProgress;
   const kos = toKeyObjs(apiKeys);
