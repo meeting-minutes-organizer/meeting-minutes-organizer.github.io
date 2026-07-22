@@ -12,17 +12,21 @@
   :root { --bg:#000; --card:#1c1c1e; --ink:#f2f2f7; --muted:#8e8e93; --line:#38383a; --btn2:#2c2c2e; }
 }
 * { box-sizing: border-box; -webkit-tap-highlight-color: transparent; }
-html, body { margin: 0; }
-html { background: var(--bg); min-height: 100%; } /* 跟隨主題色，避免底部露出色塊 */
+html, body { margin: 0; height: 100%; }
+html { background: var(--bg); } /* 跟隨主題色，避免底部露出色塊 */
 body {
   font-family: -apple-system, "PingFang TC", "Helvetica Neue", "Microsoft JhengHei", sans-serif;
   background: var(--bg);
   color: var(--ink);
-  min-height: 100vh;
-  /* 上方安全區改由 .topbar 自己處理（sticky 捲動時才不會蓋到狀態列） */
+  /* App 外殼版面：整頁固定滿版，只有中間內容區捲動。
+     這樣頂欄與底部頁籤是靜態骨架、永遠釘住，徹底避開 iOS「fixed 列捲動時飄到中間」的 bug。 */
+  height: 100vh;
+  height: 100dvh;
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
   padding: 0 env(safe-area-inset-right) 0 env(safe-area-inset-left);
   -webkit-text-size-adjust: 100%;
-  /* 原生手感：禁止長按選單、禁止整頁彈跳 */
   -webkit-touch-callout: none;
   overscroll-behavior: none;
   -webkit-user-select: none;
@@ -59,13 +63,12 @@ button:active { transform: scale(0.97); }
 }
 .install-banner .x { margin-left: auto; color: var(--muted); font-size: 20px; padding: 0 4px; }
 .topbar {
-  position: sticky; top: 0; z-index: 10;
+  flex: 0 0 auto; z-index: 10;
   display: flex; align-items: center; gap: 8px;
-  /* 安全區留白放在頂欄內：捲動時整條（含毛玻璃底）蓋住狀態列區，按鈕永遠在可點位置 */
+  /* 安全區留白放在頂欄內，按鈕永遠在狀態列下方可點位置 */
   padding: calc(8px + env(safe-area-inset-top)) 12px 8px;
-  background: color-mix(in srgb, var(--bg) 88%, transparent);
-  backdrop-filter: saturate(180%) blur(14px);
-  -webkit-backdrop-filter: saturate(180%) blur(14px);
+  background: var(--bg);
+  border-bottom: 1px solid var(--line);
 }
 .topbar h1 { flex: 1; font-size: 17px; font-weight: 600; margin: 0; text-align: center; min-width: 0; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
 /* 頂欄按鈕：44px 圓鈕（iOS 建議的最小觸控尺寸）+ 線條風向量圖示 */
@@ -78,7 +81,12 @@ button:active { transform: scale(0.97); }
 .ghost svg { width: 21px; height: 21px; fill: none; stroke: currentColor; stroke-width: 2.1; stroke-linecap: round; stroke-linejoin: round; flex: 0 0 auto; }
 #backBtn { width: auto; padding: 0 14px 0 8px; border-radius: 22px; }
 #backBtn svg { width: 19px; height: 19px; }
-main { padding: 8px 16px 100px; max-width: 720px; margin: 0 auto; }
+/* 唯一的捲動容器：只有它捲動，頂欄/頁籤不動 */
+main {
+  flex: 1 1 auto; min-height: 0; width: 100%; max-width: 720px; margin: 0 auto;
+  overflow-y: auto; -webkit-overflow-scrolling: touch; overscroll-behavior: contain;
+  padding: 8px 16px 20px;
+}
 .card {
   background: var(--card); border-radius: 14px; padding: 16px; margin-bottom: 12px;
   box-shadow: 0 1px 3px rgba(0,0,0,.06);
@@ -92,13 +100,9 @@ main { padding: 8px 16px 100px; max-width: 720px; margin: 0 auto; }
 }
 .card.tap:active { transform: scale(0.99); }
 .tabbar {
-  position: fixed; left: 0; right: 0; bottom: 0; z-index: 10;
+  flex: 0 0 auto; z-index: 10;
   display: flex; gap: 10px; padding: 10px 16px calc(10px + env(safe-area-inset-bottom));
   background: var(--card); border-top: 1px solid var(--line);
-  /* 提升成獨立合成圖層：修正 iOS Safari 長頁面捲動時 fixed 列「飄到畫面中間」的重繪 bug */
-  transform: translateZ(0);
-  -webkit-transform: translateZ(0);
-  will-change: transform;
 }
 .tabbar button { flex: 1; padding: 14px; border: none; border-radius: 12px; font-size: 15px; font-weight: 600; background: var(--btn2); color: var(--ink); box-shadow: 0 1px 2px rgba(0,0,0,.12); }
 .tabbar .primary { background: var(--brand); color: #fff; }
