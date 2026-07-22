@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v43';
+const APP_VERSION = 'v44';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1210,8 +1210,12 @@ async function renderDetail(id) {
           fresh.terms.items.push({ t: oldV, cat: 'term', fix: '', applied: newV });
         }
       }, { edit: true });
+      // 訂正會清掉舊翻譯 → 切回原文，並即時重繪上方的待辦/重點/Q&A/逐字稿
+      lang = 'orig';
+      document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === 'orig'));
+      drawBody('orig');
       drawTerms();
-      toast('已訂正並更新全文 ✓');
+      toast('已訂正，待辦／重點／Q&A／逐字稿都已更新 ✓');
     };
   };
 
