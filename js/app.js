@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms } from './gemini.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v42';
+const APP_VERSION = 'v43';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -869,6 +869,10 @@ async function renderDetail(id) {
       </div>
     </div>
     <div id="detailBody"></div>
+    <div class="card" id="termsCard">
+      <div class="section-title sec-head" data-sec="terms" style="margin-top:0"><span class="sec-t">📝 專有名詞訂正</span><span class="sec-right"><span class="chev" id="termsChev">▾</span></span></div>
+      <div class="sec-body" id="termsSecBody"><div id="termsBody"></div></div>
+    </div>
     <div class="card" id="chatCard">
       <div class="section-title" style="margin-top:0">💬 問這場會議 <button class="copy" id="chatClear" hidden>清除紀錄</button></div>
       <div id="chatLog"></div>
@@ -1091,6 +1095,152 @@ async function renderDetail(id) {
 
   document.getElementById('pdfBtn').onclick = () => exportPdf(viewMeeting());
   document.getElementById('wordBtn').onclick = () => exportWord(viewMeeting());
+
+  // ---- 專有名詞訂正 ----
+  // 摺疊狀態（沿用逐字稿等區塊的 localStorage 'sec_collapsed'）；此區預設收合
+  const termsSecBody = document.getElementById('termsSecBody');
+  const termsChev = document.getElementById('termsChev');
+  const termsBody = document.getElementById('termsBody');
+  const collState = () => {
+    try { return JSON.parse(localStorage.getItem('sec_collapsed')) || {}; } catch (_) { return {}; }
+  };
+  const setTermsCollapsed = (v) => {
+    const c = collState();
+    c.terms = v ? 1 : 0;
+    localStorage.setItem('sec_collapsed', JSON.stringify(c));
+    termsSecBody.hidden = !!v;
+    termsChev.textContent = v ? '▸' : '▾';
+  };
+  setTermsCollapsed(collState().terms === undefined ? true : !!collState().terms);
+  document.querySelector('#termsCard .sec-head').onclick = () => setTermsCollapsed(!collState().terms);
+
+  // 保護式全文替換：先把已正確的 newV 藏起來，只換掉落單的 oldV，再還原
+  // → 避免「台積 → 台積電」把原本就正確的「台積電」變成「台積電電」
+  const protectedReplace = (text, oldV, newV) => {
+    if (!oldV || oldV === newV) return text;
+    const SENT = '';
+    return String(text == null ? '' : text).split(newV).join(SENT).split(oldV).join(newV).split(SENT).join(newV);
+  };
+  const applyTerm = (fresh, oldV, newV) => {
+    (fresh.transcript || []).forEach((s) => { s.text = protectedReplace(s.text, oldV, newV); });
+    const s = fresh.summary || {};
+    ['actionItems', 'mainPoints', 'keyPoints', 'qa'].forEach((k) => {
+      if (Array.isArray(s[k])) s[k] = s[k].map((x) => protectedReplace(x, oldV, newV));
+    });
+    fresh.translations = {}; // 內容改了 → 清掉舊翻譯
+  };
+
+  const TERM_CATS = {
+    person: { label: '人名', color: '#0a84ff' },
+    org: { label: '公司', color: '#af52de' },
+    product: { label: '產品', color: '#ff9500' },
+    place: { label: '地名', color: '#34c759' },
+    country: { label: '國家', color: '#ff2d55' },
+    term: { label: '術語', color: '#5ac8fa' },
+  };
+  const catMeta = (c) => TERM_CATS[c] || TERM_CATS.term;
+
+  const drawTerms = () => {
+    const data = m.terms;
+    if (!data || !data.items) {
+      termsBody.innerHTML = `<div class="hint" style="margin-top:0">自動挑出逐字稿裡的人名、公司、產品、地名等專有名詞，把辨識聽錯／拼錯的字一次改對（會同時更新逐字稿與摘要）。</div>
+        <button class="big" id="scanTerms">🔍 自動挑出專有名詞</button>`;
+      const sb = document.getElementById('scanTerms');
+      if (sb) sb.onclick = () => doScanTerms(sb);
+      return;
+    }
+    const items = data.items || [];
+    const rows = items
+      .map((it, i) => {
+        const meta = catMeta(it.cat);
+        const chip = `<span class="term-chip" style="color:${meta.color};border-color:${meta.color}">${meta.label}</span>`;
+        if (it.applied) {
+          return `<div class="term-row done" data-i="${i}">${chip}<span class="term-pair"><span class="term-old">${esc(it.t)}</span><span class="term-arrow">→</span><span class="term-new">${esc(it.applied)}</span></span><span class="term-tick">✓</span></div>`;
+        }
+        return `<div class="term-row" data-i="${i}">${chip}<span class="term-word">${esc(it.t)}</span><span class="term-go">訂正 ›</span></div>`;
+      })
+      .join('');
+    termsBody.innerHTML = `
+      <div class="term-actions">
+        <button class="act-btn" id="rescanTerms">🔄 重新掃描</button>
+        <button class="act-btn" id="addTerm">＋ 手動新增</button>
+      </div>
+      ${items.length ? `<div class="term-list">${rows}</div>` : '<div class="hint">這份逐字稿沒有挑到明顯的專有名詞。你可以用「手動新增」自己補。</div>'}`;
+    document.getElementById('rescanTerms').onclick = (e) => doScanTerms(e.target);
+    document.getElementById('addTerm').onclick = () => openTermEditor(-1);
+    termsBody.querySelectorAll('.term-row').forEach((r) => {
+      r.onclick = () => openTermEditor(+r.dataset.i);
+    });
+  };
+
+  // 開啟訂正輸入（idx=-1 表示手動新增）
+  const openTermEditor = (idx) => {
+    const items = (m.terms && m.terms.items) || [];
+    const it = idx >= 0 ? items[idx] : null;
+    const curOld = it ? (it.applied || it.t) : '';
+    const prefill = it ? (it.applied || it.fix || it.t) : '';
+    const row = idx >= 0 ? termsBody.querySelector(`.term-row[data-i="${idx}"]`) : null;
+    const editorHtml = `<div class="term-editor">
+      ${idx < 0 ? '<input class="term-input" id="tOld" placeholder="辨識錯的字（原文中的寫法）" />' : ''}
+      <input class="term-input" id="tNew" placeholder="正確的寫法" value="${esc(prefill)}" />
+      <div class="term-edit-ops"><button class="act-btn primary" id="tSave">套用訂正</button><button class="act-btn" id="tCancel">取消</button></div>
+      <div class="hint" style="margin:2px 0 0">會把逐字稿與摘要裡所有「${idx < 0 ? '這個字' : esc(curOld)}」一次改成新的寫法。</div>
+    </div>`;
+    if (row) { row.outerHTML = editorHtml; } else {
+      const div = document.createElement('div');
+      div.innerHTML = editorHtml;
+      termsBody.querySelector('.term-list, .term-actions').after(div.firstElementChild);
+    }
+    const box = termsBody.querySelector('.term-editor');
+    const newInp = box.querySelector('#tNew');
+    newInp.focus();
+    box.querySelector('#tCancel').onclick = () => drawTerms();
+    box.querySelector('#tSave').onclick = async () => {
+      const oldV = idx >= 0 ? curOld : (box.querySelector('#tOld').value || '').trim();
+      const newV = (newInp.value || '').trim();
+      if (!oldV) { alert('請填入辨識錯的字'); return; }
+      if (!newV || newV === oldV) { drawTerms(); return; }
+      await persist((fresh) => {
+        applyTerm(fresh, oldV, newV);
+        fresh.terms = fresh.terms || { items: [] };
+        fresh.terms.items = fresh.terms.items || [];
+        if (idx >= 0 && fresh.terms.items[idx]) {
+          fresh.terms.items[idx].applied = newV;
+        } else {
+          fresh.terms.items.push({ t: oldV, cat: 'term', fix: '', applied: newV });
+        }
+      }, { edit: true });
+      drawTerms();
+      toast('已訂正並更新全文 ✓');
+    };
+  };
+
+  const doScanTerms = async (btn) => {
+    if (!hasApiKey()) { alert('請先到 ⚙︎ 設定填入 Gemini 金鑰'); return; }
+    if (!(m.transcript && m.transcript.length)) { alert('這場沒有逐字稿，無法挑詞'); return; }
+    const old = btn && btn.textContent;
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ 掃描中…'; }
+    try {
+      const found = await extractTerms(m.transcript, getApiKeyEntries(), {
+        onProgress: (info) => { if (btn && info && info.message) btn.textContent = '⏳ ' + info.message; },
+      });
+      // 保留已訂正過的詞，合併新挑到的
+      await persist((fresh) => {
+        const prevApplied = ((fresh.terms && fresh.terms.items) || []).filter((x) => x.applied);
+        const seen = new Set(prevApplied.map((x) => x.t));
+        const merged = prevApplied.slice();
+        for (const f of found) if (!seen.has(f.t)) { merged.push(f); seen.add(f.t); }
+        fresh.terms = { scannedAt: Date.now(), items: merged };
+      });
+      drawTerms();
+      const n = (m.terms.items || []).filter((x) => !x.applied).length;
+      toast(n ? `挑出 ${n} 個待訂正的詞` : '沒有挑到需要訂正的詞');
+    } catch (e) {
+      alert('挑詞失敗：' + (e && e.message ? e.message : e));
+      if (btn) { btn.disabled = false; btn.textContent = old; }
+    }
+  };
+  drawTerms();
 
   // 加強某一區塊（分段掃整份逐字稿抓完整清單）
   const doEnhance = async (section, btn) => {

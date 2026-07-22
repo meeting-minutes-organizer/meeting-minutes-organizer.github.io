@@ -205,6 +205,34 @@ textarea.seg-edit { width: 100%; margin-top: 6px; padding: 10px; border: 1.5px s
 .seg-edit-ops { display: flex; gap: 6px; margin: 6px 0 4px; }
 .seg-edit-ops .act-btn { flex: 1; }
 
+/* ---- 專有名詞訂正 ---- */
+.term-actions { display: flex; gap: 6px; margin-bottom: 10px; }
+.term-list { display: flex; flex-direction: column; gap: 8px; }
+.term-row {
+  display: flex; align-items: center; gap: 9px; cursor: pointer;
+  background: var(--bg); border: 1px solid var(--hair, var(--line)); border-radius: 11px; padding: 10px 12px;
+}
+.term-row:active { transform: scale(0.99); }
+.term-chip {
+  flex: 0 0 auto; font-size: 11.5px; font-weight: 700; border: 1px solid; border-radius: 999px;
+  padding: 2px 9px; background: transparent;
+}
+.term-word { flex: 1 1 auto; min-width: 0; font-weight: 600; word-break: break-all; }
+.term-go { flex: 0 0 auto; color: var(--brand); font-size: 13px; font-weight: 600; }
+.term-row.done { cursor: pointer; opacity: 0.95; }
+.term-pair { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.term-old { color: var(--muted); text-decoration: line-through; word-break: break-all; }
+.term-arrow { color: var(--muted); }
+.term-new { color: var(--ink); font-weight: 700; word-break: break-all; }
+.term-tick { flex: 0 0 auto; color: #1f9d55; font-weight: 800; }
+.term-editor { background: var(--bg); border: 1px solid var(--brand); border-radius: 11px; padding: 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
+.term-input {
+  width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px;
+  font-size: 15px; background: var(--card); color: var(--ink); font-family: inherit;
+}
+.term-edit-ops { display: flex; gap: 6px; }
+.term-edit-ops .act-btn { flex: 1; }
+
 /* ---- 會議問答 ---- */
 #chatInput { width: 100%; padding: 12px; border: 1px solid var(--line); border-radius: 10px; font-size: 15px; line-height: 1.5; background: var(--bg); color: var(--ink); font-family: inherit; }
 .chat-q { font-weight: 700; margin: 12px 0 4px; line-height: 1.5; }

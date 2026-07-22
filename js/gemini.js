@@ -601,6 +601,71 @@ export async function regenerateSummary(segments, apiKeys, opts = {}) {
   return summarizeSegments(segments, kos, model, onProgress);
 }
 
+// ---- 專有名詞抽取：從逐字稿挑出人名/公司/產品/地名/國家/術語，優先挑可能被聽錯拼錯的 ----
+const TERMS_SCHEMA = {
+  type: 'object',
+  properties: {
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          term: { type: 'string' },
+          category: { type: 'string', enum: ['person', 'org', 'product', 'place', 'country', 'term'] },
+          fix: { type: 'string' },
+        },
+        required: ['term', 'category'],
+      },
+    },
+  },
+  required: ['items'],
+};
+export async function extractTerms(segments, apiKeys, opts = {}) {
+  const onProgress = opts.onProgress;
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+  report(onProgress, 'model', 3, '選擇型號中…');
+  const model = await resolveModel(kos.map((k) => k.key), { preferLite: false }); // 固定用品質模型
+  const variants = kos.map((k) => ({ key: k.key, name: k.name }));
+  const segs = segments || [];
+  const BATCH = 80;
+  const nb = Math.max(1, Math.ceil(segs.length / BATCH));
+  const map = new Map(); // term → item（跨批次去重）
+  for (let i = 0; i < segs.length; i += BATCH) {
+    const text = segs.slice(i, i + BATCH).map((s) => `${s.speaker}：${s.text}`).join('\n');
+    const prompt =
+      `以下是一段會議逐字稿。請挑出裡面的「專有名詞」：人名(person)、公司或組織(org)、產品(product)、地名(place)、國家(country)、專業術語(term)。\n` +
+      `重點：優先挑出「可能被語音辨識聽錯或拼錯」的詞。一般常見字詞不要放。\n` +
+      `每筆回傳 {"term":"逐字稿中實際出現的寫法","category":"person|org|product|place|country|term","fix":"若你判斷它明顯拼錯/聽錯，給一個最可能的正確寫法；不確定就留空字串"}。\n` +
+      `只輸出 JSON {"items":[...]}。逐字稿：\n` +
+      text;
+    const res = await postJsonRotating(
+      variants,
+      (v) => ({
+        url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: 'application/json', responseSchema: TERMS_SCHEMA, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
+        }),
+      }),
+      onProgress,
+      `挑出專有名詞中…（${Math.floor(i / BATCH) + 1}/${nb}）`
+    );
+    const data = await res.json();
+    const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    if (!out) continue;
+    try {
+      const r = JSON.parse(out);
+      for (const it of r.items || []) {
+        const term = (it.term || '').trim();
+        if (!term) continue;
+        if (!map.has(term)) map.set(term, { t: term, cat: it.category || 'term', fix: (it.fix || '').trim() });
+      }
+    } catch (_) {}
+  }
+  return Array.from(map.values());
+}
+
 // ---- 翻譯（純文字，很省）：固定用品質模型；逐字稿分批翻避免超過輸出上限 ----
 const LANG_LABEL = { zh: '繁體中文 (Traditional Chinese)', en: 'English', ja: '日本語 (Japanese)' };
 const SUMMARY_TR_SCHEMA = {
