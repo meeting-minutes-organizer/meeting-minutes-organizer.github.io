@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v44';
+const APP_VERSION = 'v45';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1140,20 +1140,29 @@ async function renderDetail(id) {
   };
   const catMeta = (c) => TERM_CATS[c] || TERM_CATS.term;
 
+  // 目前「文中的實際寫法」：已套用過就是 applied，否則是原詞 t
+  const termCurrent = (it) => it.applied || it.t;
+  // 待套用：有草稿且草稿 ≠ 目前寫法
+  const termPending = (it) => it.draft && it.draft !== termCurrent(it);
+
   const drawTerms = () => {
     const data = m.terms;
     if (!data || !data.items) {
-      termsBody.innerHTML = `<div class="hint" style="margin-top:0">自動挑出逐字稿裡的人名、公司、產品、地名等專有名詞，把辨識聽錯／拼錯的字一次改對（會同時更新逐字稿與摘要）。</div>
+      termsBody.innerHTML = `<div class="hint" style="margin-top:0">自動挑出逐字稿裡的人名、公司、產品、地名等專有名詞，把辨識聽錯／拼錯的字改對（會同時更新逐字稿與摘要）。<br>可以先<b>逐一改好、最後按一次「套用全部訂正」</b>統一生效。</div>
         <button class="big" id="scanTerms">🔍 自動挑出專有名詞</button>`;
       const sb = document.getElementById('scanTerms');
       if (sb) sb.onclick = () => doScanTerms(sb);
       return;
     }
     const items = data.items || [];
+    const pendingCount = items.filter(termPending).length;
     const rows = items
       .map((it, i) => {
         const meta = catMeta(it.cat);
         const chip = `<span class="term-chip" style="color:${meta.color};border-color:${meta.color}">${meta.label}</span>`;
+        if (termPending(it)) {
+          return `<div class="term-row pending" data-i="${i}">${chip}<span class="term-pair"><span class="term-old">${esc(termCurrent(it))}</span><span class="term-arrow">→</span><span class="term-new">${esc(it.draft)}</span></span><span class="term-badge">待套用</span></div>`;
+        }
         if (it.applied) {
           return `<div class="term-row done" data-i="${i}">${chip}<span class="term-pair"><span class="term-old">${esc(it.t)}</span><span class="term-arrow">→</span><span class="term-new">${esc(it.applied)}</span></span><span class="term-tick">✓</span></div>`;
         }
@@ -1165,26 +1174,29 @@ async function renderDetail(id) {
         <button class="act-btn" id="rescanTerms">🔄 重新掃描</button>
         <button class="act-btn" id="addTerm">＋ 手動新增</button>
       </div>
-      ${items.length ? `<div class="term-list">${rows}</div>` : '<div class="hint">這份逐字稿沒有挑到明顯的專有名詞。你可以用「手動新增」自己補。</div>'}`;
+      ${items.length ? `<div class="term-list">${rows}</div>` : '<div class="hint">這份逐字稿沒有挑到明顯的專有名詞。你可以用「手動新增」自己補。</div>'}
+      ${pendingCount ? `<button class="big" id="applyTerms" style="margin-top:12px">✅ 套用全部訂正（${pendingCount}）</button><div class="hint" style="margin-top:6px">按下後才會一次改動逐字稿與摘要，並同步雲端。</div>` : ''}`;
     document.getElementById('rescanTerms').onclick = (e) => doScanTerms(e.target);
     document.getElementById('addTerm').onclick = () => openTermEditor(-1);
     termsBody.querySelectorAll('.term-row').forEach((r) => {
       r.onclick = () => openTermEditor(+r.dataset.i);
     });
+    const ap = document.getElementById('applyTerms');
+    if (ap) ap.onclick = () => applyAllTerms();
   };
 
-  // 開啟訂正輸入（idx=-1 表示手動新增）
+  // 開啟訂正輸入（idx=-1 表示手動新增）；只「暫存草稿」，不立即改動全文
   const openTermEditor = (idx) => {
     const items = (m.terms && m.terms.items) || [];
     const it = idx >= 0 ? items[idx] : null;
-    const curOld = it ? (it.applied || it.t) : '';
-    const prefill = it ? (it.applied || it.fix || it.t) : '';
+    const curOld = it ? termCurrent(it) : '';
+    const prefill = it ? (it.draft || it.fix || termCurrent(it)) : '';
     const row = idx >= 0 ? termsBody.querySelector(`.term-row[data-i="${idx}"]`) : null;
     const editorHtml = `<div class="term-editor">
       ${idx < 0 ? '<input class="term-input" id="tOld" placeholder="辨識錯的字（原文中的寫法）" />' : ''}
       <input class="term-input" id="tNew" placeholder="正確的寫法" value="${esc(prefill)}" />
-      <div class="term-edit-ops"><button class="act-btn primary" id="tSave">套用訂正</button><button class="act-btn" id="tCancel">取消</button></div>
-      <div class="hint" style="margin:2px 0 0">會把逐字稿與摘要裡所有「${idx < 0 ? '這個字' : esc(curOld)}」一次改成新的寫法。</div>
+      <div class="term-edit-ops"><button class="act-btn primary" id="tSave">${idx < 0 ? '加入清單' : '暫存這筆'}</button><button class="act-btn" id="tCancel">取消</button></div>
+      <div class="hint" style="margin:2px 0 0">先暫存，最後按「套用全部訂正」才會真正改動全文。</div>
     </div>`;
     if (row) { row.outerHTML = editorHtml; } else {
       const div = document.createElement('div');
@@ -1199,24 +1211,39 @@ async function renderDetail(id) {
       const oldV = idx >= 0 ? curOld : (box.querySelector('#tOld').value || '').trim();
       const newV = (newInp.value || '').trim();
       if (!oldV) { alert('請填入辨識錯的字'); return; }
-      if (!newV || newV === oldV) { drawTerms(); return; }
+      // 暫存草稿（存本機、不同步、不動全文）；設回目前寫法等於取消該筆草稿
       await persist((fresh) => {
-        applyTerm(fresh, oldV, newV);
         fresh.terms = fresh.terms || { items: [] };
         fresh.terms.items = fresh.terms.items || [];
         if (idx >= 0 && fresh.terms.items[idx]) {
-          fresh.terms.items[idx].applied = newV;
-        } else {
-          fresh.terms.items.push({ t: oldV, cat: 'term', fix: '', applied: newV });
+          if (!newV || newV === termCurrent(fresh.terms.items[idx])) delete fresh.terms.items[idx].draft;
+          else fresh.terms.items[idx].draft = newV;
+        } else if (newV && newV !== oldV) {
+          fresh.terms.items.push({ t: oldV, cat: 'term', fix: '', draft: newV });
         }
-      }, { edit: true });
-      // 訂正會清掉舊翻譯 → 切回原文，並即時重繪上方的待辦/重點/Q&A/逐字稿
-      lang = 'orig';
-      document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === 'orig'));
-      drawBody('orig');
+      }, { sync: false });
       drawTerms();
-      toast('已訂正，待辦／重點／Q&A／逐字稿都已更新 ✓');
     };
+  };
+
+  // 一次套用所有「待套用」的草稿：單次全文替換 + 單次同步 + 單次重繪
+  const applyAllTerms = async () => {
+    const pend = ((m.terms && m.terms.items) || []).filter(termPending);
+    if (!pend.length) return;
+    await persist((fresh) => {
+      for (const it of fresh.terms.items) {
+        if (it.draft && it.draft !== termCurrent(it)) {
+          applyTerm(fresh, termCurrent(it), it.draft);
+          it.applied = it.draft;
+          delete it.draft;
+        }
+      }
+    }, { edit: true });
+    lang = 'orig';
+    document.querySelectorAll('#langToggle button').forEach((b) => b.classList.toggle('active', b.dataset.l === 'orig'));
+    drawBody('orig');
+    drawTerms();
+    toast(`已套用 ${pend.length} 個訂正，全文都已更新 ✓`);
   };
 
   const doScanTerms = async (btn) => {

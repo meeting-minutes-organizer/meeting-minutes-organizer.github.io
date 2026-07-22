@@ -225,6 +225,8 @@ textarea.seg-edit { width: 100%; margin-top: 6px; padding: 10px; border: 1.5px s
 .term-arrow { color: var(--muted); }
 .term-new { color: var(--ink); font-weight: 700; word-break: break-all; }
 .term-tick { flex: 0 0 auto; color: #1f9d55; font-weight: 800; }
+.term-row.pending { border-color: #ff9500; background: color-mix(in srgb, #ff9500 8%, transparent); }
+.term-badge { flex: 0 0 auto; font-size: 11px; font-weight: 800; color: #ff9500; border: 1px solid #ff9500; border-radius: 999px; padding: 2px 8px; }
 .term-editor { background: var(--bg); border: 1px solid var(--brand); border-radius: 11px; padding: 12px; margin-top: 8px; display: flex; flex-direction: column; gap: 8px; }
 .term-input {
   width: 100%; padding: 11px 12px; border: 1px solid var(--line); border-radius: 9px;
