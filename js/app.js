@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v41';
+const APP_VERSION = 'v42';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -651,9 +651,12 @@ async function processJob(job, container) {
     const canResume = prepared();
     container.innerHTML = `<div class="err">❌ ${esc(e && e.message ? e.message : '發生未知錯誤')}</div>
       <div class="hint" style="margin-top:6px">${canResume ? '進度已保存，可從中斷處繼續。' : '請重新選擇檔案再試。'}</div>
-      <button class="big" id="retryJob">${canResume ? '繼續辨識' : '返回'}</button>`;
+      <button class="big" id="retryJob">${canResume ? '繼續辨識' : '返回'}</button>
+      <button class="big danger" id="cancelJob" style="margin-top:8px">取消並刪除這場任務</button>`;
     const rb = document.getElementById('retryJob');
     if (rb) rb.onclick = () => (prepared() ? openJobProgress(job) : (location.hash = '#/new'));
+    const cb = document.getElementById('cancelJob');
+    if (cb) cb.onclick = () => cancelActiveJob(job);
     refreshResumeBanner();
   } finally {
     if (wakeLock) {
@@ -728,6 +731,22 @@ async function startNewTranscription(files) {
   await openJobProgress(job);
 }
 
+// 取消並刪除進行中/卡住的辨識任務（無論有沒有可續傳的進度）
+async function cancelActiveJob(job) {
+  if (!confirm('確定取消並刪除這場辨識任務？已辨識的進度會一併清除，之後要重新選檔。')) return;
+  try {
+    const active = job || (await getActiveJob());
+    if (active) await clearJob(active.id || 'active');
+  } catch (_) {}
+  jobRunning = false;
+  transcribing = false;
+  const banner = document.getElementById('resume-banner');
+  if (banner) banner.remove();
+  toast('已取消辨識任務');
+  location.hash = '#/';
+  router();
+}
+
 async function refreshResumeBanner() {
   const existing = document.getElementById('resume-banner');
   if (existing) existing.remove();
@@ -738,10 +757,14 @@ async function refreshResumeBanner() {
   const b = document.createElement('div');
   b.id = 'resume-banner';
   b.className = 'install-banner';
-  b.innerHTML = `<span>⏳ 有一場辨識未完成（${doneCount}/${job.chunks.length} 段），點此繼續</span>`;
-  b.onclick = () => {
+  b.innerHTML = `<span id="resumeGo">⏳ 有一場辨識未完成（${doneCount}/${job.chunks.length} 段），點此繼續</span><span class="x" id="resumeX" title="取消刪除">×</span>`;
+  b.querySelector('#resumeGo').onclick = () => {
     b.remove();
     openJobProgress(job);
+  };
+  b.querySelector('#resumeX').onclick = (e) => {
+    e.stopPropagation();
+    cancelActiveJob(job);
   };
   document.body.appendChild(b);
 }

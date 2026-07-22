@@ -16,6 +16,13 @@ export function setPreferLite(v) {
   preferLite = !!v;
 }
 
+// 某些新模型（強制思考）不接受 thinkingBudget:0，會回 400。
+// 一旦偵測到，本階段之後的請求都不再送 thinkingConfig。
+let thinkingRejected = false;
+export function resetThinkingFlag() {
+  thinkingRejected = false;
+}
+
 // 動態挑選型號：向 API 詢問目前可用的模型，挑最適合的。
 // 這樣 Google 汰換型號名稱（如 2.5-flash → 3.5-flash）時 App 不會壞。
 export function pickModel(models, opts = {}) {
@@ -190,7 +197,16 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       vi++;
       const multi = vs.length > 1;
       report(onProgress, 'transcribe', null, round === 0 && k === 0 ? label : multi ? '切換金鑰重試中…' : `重試中…（第 ${round} 次）`, v.name);
-      const { url, body } = makeReq(v);
+      const { url, body: rawBody } = makeReq(v);
+      // 若本階段已知模型拒絕 thinkingBudget:0，主動移除該參數再送
+      let body = rawBody;
+      if (thinkingRejected && /thinking/i.test(rawBody)) {
+        try {
+          const o = JSON.parse(rawBody);
+          if (o.generationConfig) delete o.generationConfig.thinkingConfig;
+          body = JSON.stringify(o);
+        } catch (_) {}
+      }
       if (v.key) recordUse(v.key);
       let res;
       try {
@@ -212,6 +228,24 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       if (isTransientStatus(res.status)) {
         sawTransient = true;
         continue;
+      }
+      // 400 INVALID_ARGUMENT：常見於新模型不接受 thinkingBudget:0（強制思考）。
+      // 自動改成「不帶 thinkingConfig」重試一次；成功就記住，本階段之後都不再送。
+      if (res.status === 400 && !thinkingRejected && /thinking/i.test(body)) {
+        try {
+          const alt = JSON.parse(body);
+          if (alt.generationConfig) delete alt.generationConfig.thinkingConfig;
+          const res2 = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(alt) });
+          if (res2.ok) {
+            thinkingRejected = true;
+            return res2;
+          }
+          lastText = await res2.text();
+          lastStatus = res2.status;
+        } catch (_) {}
+      }
+      if (res.status === 400) {
+        throw new Error(`${act}失敗 (400)：這個檔案可能格式不支援或已損毀，建議換一個音檔（m4a／mp3／wav）再試。原始訊息：${lastText.slice(0, 200)}`);
       }
       throw new Error(`${act}失敗 (${res.status})：${lastText.slice(0, 300)}`);
     }
