@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, requestAbort, clearAbort, isAborted, missingKeyEntries } from './gemini.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v47';
+const APP_VERSION = 'v53';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -106,6 +106,61 @@ function toast(msg) {
   t.classList.add('show');
   clearTimeout(t._h);
   t._h = setTimeout(() => t.classList.remove('show'), 2600);
+}
+
+// ===== 會議詳情頁的長時間工作（加強／掃描／問答）=====
+// 這些工作 await 期間，使用者可能切到設定等其他頁再回來 → 畫面重繪、按鈕狀態被重置。
+// 工作本身其實還在跑（Promise 不會因為重繪而中斷），但畫面上看不出來，
+// 使用者會誤以為它停了而再點一次 → 重複燒額度、兩份結果互相覆寫。
+// 解法同辨識任務：狀態存在畫面之外，重繪後再畫回去。
+const detailTasks = new Map(); // `${meetingId}|${taskKey}` → { label }
+const taskId = (meetingId, key) => `${meetingId}|${key}`;
+
+function currentDetailId() {
+  return location.hash.startsWith('#/m/') ? location.hash.slice(4) : '';
+}
+// 把執行中的工作狀態畫回按鈕（畫面可能剛重繪過）
+function paintDetailTasks() {
+  const id = currentDetailId();
+  if (!id) return;
+  let busy = false;
+  document.querySelectorAll('[data-task]').forEach((b) => {
+    const t = detailTasks.get(taskId(id, b.dataset.task));
+    if (t) {
+      busy = true;
+      if (!b.dataset.origLabel) b.dataset.origLabel = b.textContent;
+      b.textContent = '⏳ ' + t.label;
+    } else if (b.dataset.origLabel) {
+      b.textContent = b.dataset.origLabel;
+      b.removeAttribute('data-orig-label');
+    }
+  });
+  // 有工作在跑就停用整排動作鈕，避免同時開第二個
+  document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = busy));
+}
+function detailBusy() {
+  const id = currentDetailId();
+  if (!id) return false;
+  for (const k of detailTasks.keys()) if (k.startsWith(id + '|')) return true;
+  return false;
+}
+// 執行一項會議詳情工作；fn 收到 setMsg 用來回報進度
+async function runDetailTask(meetingId, key, initialLabel, fn) {
+  const k = taskId(meetingId, key);
+  detailTasks.set(k, { label: initialLabel });
+  paintDetailTasks();
+  try {
+    return await fn((msg) => {
+      const t = detailTasks.get(k);
+      if (t && msg) {
+        t.label = msg;
+        paintDetailTasks();
+      }
+    });
+  } finally {
+    detailTasks.delete(k);
+    paintDetailTasks();
+  }
 }
 
 // 辨識中防止誤關頁面
@@ -385,6 +440,16 @@ async function importBackup(file) {
 
 function renderNew() {
   setHeader('新增會議', true);
+  // 辨識中不讓使用者走進「選檔→開始→被擋下」的死巷，直接指回進度頁
+  if (jobRunning && jobState) {
+    view.innerHTML = `<div class="card">
+      <div class="warn">已有一場辨識正在進行中，完成後才能開始新的一場。</div>
+      <button class="big" id="toJob">查看目前進度</button>
+      <div class="hint" style="margin-top:6px">若它卡住了，可在進度頁按「停止辨識」。</div>
+    </div>`;
+    document.getElementById('toJob').onclick = () => (location.hash = '#/job');
+    return;
+  }
   if (!hasApiKey()) {
     view.innerHTML = `<div class="card">請先到右上角 ⚙︎ 設定，填入你的 Gemini API 金鑰。
       <button class="big" id="toSettings">前往設定</button></div>`;
@@ -443,6 +508,10 @@ function renderNew() {
 // ===== 可續傳的辨識任務 =====
 const WINDOW_SEC = 40 * 60; // 每段最長 40 分鐘（減少呼叫次數與 token 用量）
 let jobRunning = false;
+// 進度狀態獨立於畫面：使用者中途切到其他頁再回來（或按常駐橫幅）時，
+// 進度頁才能接上「正在跑的那個任務」並顯示當下進度，而不是空白畫面。
+let jobState = null; // { pct, label, keyName, startAt, job }
+let jobView = null; // 目前掛載中的進度 UI 控制器（切走時設回 null）
 
 function mmssApp(sec) {
   const s = Math.max(0, Math.round(sec));
@@ -466,34 +535,53 @@ async function persistJob(job) {
   await saveJob(clean);
 }
 
-// 進度條 UI（回傳控制器）
-function createProgress(container, estSec) {
-  const startAt = Date.now();
-  let barPct = 0;
+// 把目前的 jobState 畫到畫面上（畫面不存在就什麼都不做）。
+// 進度資料存在 jobState，畫面只是它的顯示器 → 離開再回來也能接上正在跑的任務。
+function paintJob() {
+  if (!jobState) return;
+  const c = document.getElementById('jobprog');
+  if (!c) return;
+  if (c.dataset.ready !== '1') {
+    c.innerHTML = `
+      <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
+      <div class="prog-label" id="pl">準備中…</div>
+      <div class="prog-key" id="pk" hidden></div>
+      <div class="prog-time" id="pt">已等待 0:00</div>`;
+    c.dataset.ready = '1';
+  }
+  const s = Math.floor((Date.now() - jobState.startAt) / 1000);
+  const pf = c.querySelector('#pf');
+  if (pf) pf.style.width = jobState.pct + '%';
+  const pl = c.querySelector('#pl');
+  if (pl) pl.textContent = jobState.label;
+  const pt = c.querySelector('#pt');
+  if (pt) pt.textContent = `已等待 ${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
+  const pk = c.querySelector('#pk');
+  if (pk) {
+    if (jobState.keyName) {
+      pk.textContent = '🔑 目前使用：' + jobState.keyName;
+      pk.hidden = false;
+    } else {
+      pk.hidden = true;
+    }
+  }
+}
+
+// 進度條 UI（回傳控制器）。狀態寫入 jobState，畫面由 paintJob 負責。
+function createProgress(job, estSec) {
+  jobState = { pct: 0, label: '準備中…', keyName: '', startAt: Date.now(), job };
   let easeTimer = null;
-  const q = (sel) => container.querySelector(sel);
-  const fmt = () => {
-    const s = Math.floor((Date.now() - startAt) / 1000);
-    return `${Math.floor(s / 60)}:${String(s % 60).padStart(2, '0')}`;
-  };
-  container.innerHTML = `
-    <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
-    <div class="prog-label" id="pl">準備中…</div>
-    <div class="prog-key" id="pk" hidden></div>
-    <div class="prog-time" id="pt">已等待 0:00</div>`;
+  paintJob();
   const setBar = (p) => {
-    barPct = Math.max(barPct, Math.min(100, p));
-    const pf = q('#pf');
-    if (pf) pf.style.width = barPct + '%';
+    jobState.pct = Math.max(jobState.pct, Math.min(100, p));
+    paintJob();
   };
   const setLabel = (t) => {
-    const pl = q('#pl');
-    if (pl) pl.textContent = t;
+    jobState.label = t;
+    paintJob();
+    refreshResumeBanner();
   };
-  const timeTimer = setInterval(() => {
-    const pt = q('#pt');
-    if (pt) pt.textContent = '已等待 ' + fmt();
-  }, 1000);
+  const timeTimer = setInterval(paintJob, 1000);
   const stopEase = () => {
     if (easeTimer) {
       clearInterval(easeTimer);
@@ -502,23 +590,17 @@ function createProgress(container, estSec) {
   };
   const easeTo = (target, sec) => {
     stopEase();
-    const from = barPct;
+    const from = jobState.pct;
     const es = Date.now();
     easeTimer = setInterval(() => {
       const el = (Date.now() - es) / 1000;
       setBar(from + (target - from) * Math.min(1, el / Math.max(5, sec)));
-      if (barPct >= target - 0.5) stopEase();
+      if (jobState.pct >= target - 0.5) stopEase();
     }, 400);
   };
   const setKey = (name) => {
-    const pk = q('#pk');
-    if (!pk) return;
-    if (name) {
-      pk.textContent = '🔑 目前使用：' + name;
-      pk.hidden = false;
-    } else {
-      pk.hidden = true;
-    }
+    jobState.keyName = name || '';
+    paintJob();
   };
   const onProgress = (info) => {
     if (!info) return;
@@ -536,11 +618,50 @@ function createProgress(container, estSec) {
   return { onProgress, setBar, setLabel, easeTo, stopEase, stop };
 }
 
-async function processJob(job, container) {
+// 補傳缺席的金鑰：某把金鑰上次上傳失敗（或事後才新增）時，它不在這段的上傳名單裡，
+// 整場就只能用剩下那把跑；撞到額度上限時無鑰可換，只能乾等。辨識前先補回來。
+// split 模式的分段 blob 未保留（要重新解碼整檔），成本太高，故略過。
+async function topUpMissingKeys(job, ui) {
+  const entries = getApiKeyEntries();
+  if (entries.length < 2 || !job.chunks || !job.chunks.length) return;
+  try {
+    if (job.multiFile && job._files) {
+      for (let i = 0; i < job.chunks.length; i++) {
+        const c = job.chunks[i];
+        if (!c.uploads || !c.uploads.length || c.segments) continue;
+        const missing = missingKeyEntries(c.uploads, entries);
+        if (!missing.length || !job._files[i]) continue;
+        ui.setLabel(`補傳第 ${i + 1} 支給 ${missing.map((k) => k.name || '金鑰').join('、')}…`);
+        const r = await uploadBlobToKeys(job._files[i], missing, ui.onProgress);
+        c.uploads = c.uploads.concat(r.uploads);
+      }
+    } else if (job.mode === 'whole' && job._file) {
+      const first = job.chunks[0];
+      if (!first.uploads || !first.uploads.length) return;
+      const missing = missingKeyEntries(first.uploads, entries);
+      if (!missing.length) return;
+      ui.setLabel(`補傳音檔給 ${missing.map((k) => k.name || '金鑰').join('、')}…`);
+      const r = await uploadBlobToKeys(job._file, missing, ui.onProgress);
+      job.chunks.forEach((c) => {
+        if (!c.segments) c.uploads = (c.uploads || []).concat(r.uploads);
+      });
+    } else {
+      return;
+    }
+    await persistJob(job);
+  } catch (e) {
+    if (isAborted()) throw e;
+    // 補傳失敗不該中斷任務——原本那把金鑰仍可繼續跑，只是無法輪替
+  }
+}
+
+async function processJob(job) {
   const est = Math.max(30, Math.round((job.durationSec || 0) * 0.5) + 25);
-  const ui = createProgress(container, est);
+  clearAbort(); // 上一場若被停止過，這裡要先解除，否則新任務一開始就被擋掉
+  const ui = createProgress(job, est);
   transcribing = true;
   jobRunning = true;
+  refreshResumeBanner();
   let wakeLock = null;
   try {
     if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
@@ -601,6 +722,8 @@ async function processJob(job, container) {
       await persistJob(job); // 全部上傳完成後才可續傳
     }
 
+    await topUpMissingKeys(job, ui);
+
     // 2) 逐段辨識（每段完成即存檔）
     const n = job.chunks.length;
     // 收集先前各段已出現的說話者，提示後續段落沿用相同標籤（改善跨段語者一致性）
@@ -642,21 +765,37 @@ async function processJob(job, container) {
     await clearJob(job.id);
     jobRunning = false;
     transcribing = false;
+    jobState = null;
+    ui.stop();
     location.hash = '#/m/' + meeting.id;
     syncNow();
   } catch (e) {
     ui.stop();
     jobRunning = false;
     transcribing = false;
+    jobState = null;
+    const stopped = isAborted();
+    if (stopped) {
+      // 使用者主動停止：進度已保存，回清單並用橫幅提示可繼續
+      toast('已停止辨識，進度已保留');
+      location.hash = '#/';
+      router();
+      refreshResumeBanner();
+      return;
+    }
     const canResume = prepared();
-    container.innerHTML = `<div class="err">❌ ${esc(e && e.message ? e.message : '發生未知錯誤')}</div>
-      <div class="hint" style="margin-top:6px">${canResume ? '進度已保存，可從中斷處繼續。' : '請重新選擇檔案再試。'}</div>
-      <button class="big" id="retryJob">${canResume ? '繼續辨識' : '返回'}</button>
-      <button class="big danger" id="cancelJob" style="margin-top:8px">取消並刪除這場任務</button>`;
-    const rb = document.getElementById('retryJob');
-    if (rb) rb.onclick = () => (prepared() ? openJobProgress(job) : (location.hash = '#/new'));
-    const cb = document.getElementById('cancelJob');
-    if (cb) cb.onclick = () => cancelActiveJob(job);
+    const c = document.getElementById('jobprog');
+    if (c) {
+      c.dataset.ready = '';
+      c.innerHTML = `<div class="err">❌ ${esc(e && e.message ? e.message : '發生未知錯誤')}</div>
+        <div class="hint" style="margin-top:6px">${canResume ? '進度已保存，可從中斷處繼續。' : '請重新選擇檔案再試。'}</div>
+        <button class="big" id="retryJob">${canResume ? '繼續辨識' : '返回'}</button>
+        <button class="big danger" id="cancelJob" style="margin-top:8px">取消並刪除這場任務</button>`;
+      const rb = document.getElementById('retryJob');
+      if (rb) rb.onclick = () => (prepared() ? openJobProgress(job) : (location.hash = '#/new'));
+      const cb = document.getElementById('cancelJob');
+      if (cb) cb.onclick = () => cancelActiveJob(job);
+    }
     refreshResumeBanner();
   } finally {
     if (wakeLock) {
@@ -667,22 +806,57 @@ async function processJob(job, container) {
   }
 }
 
-async function openJobProgress(job) {
-  const existing = document.getElementById('resume-banner');
-  if (existing) existing.remove();
+// 畫出進度頁的殼（不啟動任務）。renderJob 與 openJobProgress 共用。
+function paintJobShell() {
   setHeader('辨識中', true);
   view.innerHTML = `
     <div class="card">
-      <div class="warn">辨識進行中。你可以<b>在 App 內</b>切到其他畫面去忙別的，它會繼續跑；就算切出 App 造成中斷，回來也會<b>從這裡接續</b>（iPhone 無法讓網頁在背景繼續運算）。</div>
+      <div class="warn">辨識進行中。你可以<b>在 App 內</b>切到清單、設定等其他畫面去忙別的，它會<b>繼續跑</b>，隨時點畫面上方的橫幅就能回到這裡；只有<b>切出 App</b>（回主畫面或切到別的 App）才會中斷，回來會從這裡接續（iPhone 無法讓網頁在背景繼續運算）。</div>
       <div class="progress" id="jobprog"></div>
+      <button class="big danger" id="stopJob" style="margin-top:14px">■ 停止辨識</button>
+      <div class="hint" style="margin-top:6px">停止後已完成的段落會保留，之後可從中斷處繼續。</div>
     </div>`;
-  await processJob(job, document.getElementById('jobprog'));
+  paintJob();
+  const sb = document.getElementById('stopJob');
+  if (sb) sb.onclick = stopRunningJob;
+}
+
+// 回到「正在跑」的任務畫面（不重新啟動，只是重新掛上顯示器）
+function renderJob() {
+  if (!jobRunning || !jobState) {
+    location.hash = '#/';
+    return;
+  }
+  paintJobShell();
+}
+
+// 停止進行中的辨識：立即中斷（連等待重試的睡眠也會被打斷），進度保留可續傳
+function stopRunningJob() {
+  if (!jobRunning) return;
+  if (!confirm('確定停止這場辨識嗎？\n已完成的段落會保留，之後可從中斷處繼續。')) return;
+  const sb = document.getElementById('stopJob');
+  if (sb) {
+    sb.disabled = true;
+    sb.textContent = '停止中…';
+  }
+  requestAbort();
+}
+
+async function openJobProgress(job) {
+  const existing = document.getElementById('resume-banner');
+  if (existing) existing.remove();
+  if (location.hash !== '#/job') location.hash = '#/job'; // 讓「辨識中」有自己的網址，離開後回得來
+  paintJobShell();
+  await processJob(job);
 }
 
 async function startNewTranscription(files) {
   // 防止辨識中又開第二個任務（兩者共用 job id 'active' 會互相覆寫、燒雙倍額度）
   if (jobRunning) {
-    alert('已有一場辨識正在進行中，請等它完成或先返回查看進度。');
+    // 舊版只跳一句「請先返回查看進度」，但當時根本沒有返回的路 → 死路一條
+    if (confirm('已有一場辨識正在進行中。\n要前往查看它的進度嗎？（可在那裡停止它）')) {
+      location.hash = '#/job';
+    }
     return;
   }
   const active = await getActiveJob();
@@ -734,12 +908,14 @@ async function startNewTranscription(files) {
 // 取消並刪除進行中/卡住的辨識任務（無論有沒有可續傳的進度）
 async function cancelActiveJob(job) {
   if (!confirm('確定取消並刪除這場辨識任務？已辨識的進度會一併清除，之後要重新選檔。')) return;
+  if (jobRunning) requestAbort(); // 正在跑的話先中斷，否則它會繼續燒額度
   try {
     const active = job || (await getActiveJob());
     if (active) await clearJob(active.id || 'active');
   } catch (_) {}
   jobRunning = false;
   transcribing = false;
+  jobState = null;
   const banner = document.getElementById('resume-banner');
   if (banner) banner.remove();
   toast('已取消辨識任務');
@@ -749,8 +925,29 @@ async function cancelActiveJob(job) {
 
 async function refreshResumeBanner() {
   const existing = document.getElementById('resume-banner');
+  // 辨識進行中：全程顯示常駐橫幅，任何頁面都能一鍵回到進度頁。
+  // （舊版在 jobRunning 時直接隱藏橫幅 → 跑到一半離開就完全沒有入口回去。）
+  if (jobRunning && jobState) {
+    if (location.hash === '#/job') {
+      if (existing) existing.remove();
+      return;
+    }
+    const text = `⏳ 辨識進行中（${jobState.label}）· 點此查看`;
+    if (existing) {
+      const s = existing.querySelector('#resumeGo');
+      if (s) s.textContent = text;
+      return;
+    }
+    const b = document.createElement('div');
+    b.id = 'resume-banner';
+    b.className = 'install-banner';
+    b.innerHTML = `<span id="resumeGo"></span>`;
+    b.querySelector('#resumeGo').textContent = text;
+    b.onclick = () => (location.hash = '#/job');
+    document.body.appendChild(b);
+    return;
+  }
   if (existing) existing.remove();
-  if (jobRunning) return;
   const job = await getActiveJob();
   if (!job || !job.chunks || !job.chunks.length || !job.chunks.every((c) => c.uploads && c.uploads.length)) return;
   const doneCount = job.chunks.filter((c) => c.segments).length;
@@ -863,9 +1060,9 @@ async function renderDetail(id) {
         <button class="act-btn" id="wordBtn">📝 Word</button>
       </div>
       <div class="act-grid">
-        <button class="act-btn" data-enh="actionItems">✅ 加強待辦</button>
-        <button class="act-btn" data-enh="mainPoints">📌 加強重點</button>
-        <button class="act-btn" data-enh="qa">❓ 加強Q&A</button>
+        <button class="act-btn" data-enh="actionItems" data-task="enh:actionItems">✅ 加強待辦</button>
+        <button class="act-btn" data-enh="mainPoints" data-task="enh:mainPoints">📌 加強重點</button>
+        <button class="act-btn" data-enh="qa" data-task="enh:qa">❓ 加強Q&A</button>
       </div>
     </div>
     <div id="detailBody"></div>
@@ -877,7 +1074,7 @@ async function renderDetail(id) {
       <div class="section-title" style="margin-top:0">💬 問這場會議 <button class="copy" id="chatClear" hidden>清除紀錄</button></div>
       <div id="chatLog"></div>
       <textarea id="chatInput" rows="2" placeholder="輸入問題，例如：這場會議最後的結論是什麼？"></textarea>
-      <button class="big" id="chatAsk">送出問題</button>
+      <button class="big" id="chatAsk" data-task="ask">送出問題</button>
       <div class="hint">AI 只根據這場會議的逐字稿回答；問答會存在這場會議裡。</div>
     </div>
     <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
@@ -1052,15 +1249,23 @@ async function renderDetail(id) {
         document.getElementById('backZh').onclick = () => setLang('orig');
         return;
       }
+      if (detailBusy()) {
+        toast('已有一項作業進行中，請等它完成');
+        setLang('orig');
+        return;
+      }
       drawBody(l); // 顯示「翻譯中…」
       try {
         const fp = transcriptFingerprint(m.transcript); // 翻譯前記錄逐字稿指紋
-        const tr = await translateMeeting(m.transcript, m.summary, l, getApiKeyEntries(), {
-          onProgress: (info) => {
-            const el = document.getElementById('tprogmsg');
-            if (el && info && info.message) el.textContent = info.message;
-          },
-        });
+        const tr = await runDetailTask(id, 'tr:' + l, '翻譯中…', (setMsg) =>
+          translateMeeting(m.transcript, m.summary, l, getApiKeyEntries(), {
+            onProgress: (info) => {
+              setMsg(info && info.message);
+              const el = document.getElementById('tprogmsg');
+              if (el && info && info.message) el.textContent = info.message;
+            },
+          })
+        );
         // 翻譯期間若原文被改過（指紋不符）→ 丟棄這份翻譯，不落盤（避免存下對不上的翻譯）
         const cur = await get(id);
         if (cur && transcriptFingerprint(cur.transcript) !== fp) {
@@ -1149,7 +1354,7 @@ async function renderDetail(id) {
     const data = m.terms;
     if (!data || !data.items) {
       termsBody.innerHTML = `<div class="hint" style="margin-top:0">自動挑出逐字稿裡的人名、公司、產品、地名等專有名詞，把辨識聽錯／拼錯的字改對（會同時更新逐字稿與摘要）。<br>可以先<b>逐一改好、最後按一次「套用全部訂正」</b>統一生效。</div>
-        <button class="big" id="scanTerms">🔍 自動挑出專有名詞</button>`;
+        <button class="big" id="scanTerms" data-task="terms">🔍 自動挑出專有名詞</button>`;
       const sb = document.getElementById('scanTerms');
       if (sb) sb.onclick = () => doScanTerms(sb);
       return;
@@ -1171,7 +1376,7 @@ async function renderDetail(id) {
       .join('');
     termsBody.innerHTML = `
       <div class="term-actions">
-        <button class="act-btn" id="rescanTerms">🔄 重新掃描</button>
+        <button class="act-btn" id="rescanTerms" data-task="terms">🔄 重新掃描</button>
         <button class="act-btn" id="addTerm">＋ 手動新增</button>
       </div>
       ${items.length ? `<div class="term-list">${rows}</div>` : '<div class="hint">這份逐字稿沒有挑到明顯的專有名詞。你可以用「手動新增」自己補。</div>'}
@@ -1249,12 +1454,13 @@ async function renderDetail(id) {
   const doScanTerms = async (btn) => {
     if (!hasApiKey()) { alert('請先到 ⚙︎ 設定填入 Gemini 金鑰'); return; }
     if (!(m.transcript && m.transcript.length)) { alert('這場沒有逐字稿，無法挑詞'); return; }
-    const old = btn && btn.textContent;
-    if (btn) { btn.disabled = true; btn.textContent = '⏳ 掃描中…'; }
+    if (detailBusy()) { toast('已有一項作業進行中，請等它完成'); return; }
     try {
-      const found = await extractTerms(m.transcript, getApiKeyEntries(), {
-        onProgress: (info) => { if (btn && info && info.message) btn.textContent = '⏳ ' + info.message; },
-      });
+      const found = await runDetailTask(id, 'terms', '掃描中…', (setMsg) =>
+        extractTerms(m.transcript, getApiKeyEntries(), {
+          onProgress: (info) => setMsg(info && info.message),
+        })
+      );
       // 保留已訂正過的詞，合併新挑到的
       await persist((fresh) => {
         const prevApplied = ((fresh.terms && fresh.terms.items) || []).filter((x) => x.applied);
@@ -1268,7 +1474,6 @@ async function renderDetail(id) {
       toast(n ? `挑出 ${n} 個待訂正的詞` : '沒有挑到需要訂正的詞');
     } catch (e) {
       alert('挑詞失敗：' + (e && e.message ? e.message : e));
-      if (btn) { btn.disabled = false; btn.textContent = old; }
     }
   };
   drawTerms();
@@ -1284,24 +1489,27 @@ async function renderDetail(id) {
       return;
     }
     const nameMap = { actionItems: '待辦事項', mainPoints: '會議重點', qa: '會議提問 Q&A' };
+    if (detailBusy()) {
+      toast('已有一項作業進行中，請等它完成');
+      return;
+    }
     if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區的內容（其他區不變）。`)) return;
-    const old = btn.textContent;
-    document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = true));
     try {
-      const items = await enhanceSection(m.transcript, section, getApiKeyEntries(), {
-        onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '處理中…')),
-      });
+      const items = await runDetailTask(id, 'enh:' + section, `加強${nameMap[section]}中…`, (setMsg) =>
+        enhanceSection(m.transcript, section, getApiKeyEntries(), {
+          onProgress: (info) => setMsg(info && info.message),
+        })
+      );
       await persist((fresh) => {
         fresh.summary = fresh.summary || {};
         fresh.summary[section] = items;
         fresh.translations = {}; // 內容改了 → 清掉舊翻譯
       }, { edit: true });
       renderDetail(id);
-      toast(`已加強${nameMap[section]}（共 ${items.length} 筆）`);
+      const skipped = items.dropped || 0;
+      toast(`已加強${nameMap[section]}（共 ${items.length} 筆${skipped ? `，另略過 ${skipped} 則議程性問答` : ''}）`);
     } catch (e) {
       alert('加強失敗：' + (e && e.message ? e.message : e));
-      document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = false));
-      btn.textContent = old;
     }
   };
   document.querySelectorAll('[data-enh]').forEach((b) => (b.onclick = () => doEnhance(b.dataset.enh, b)));
@@ -1379,13 +1587,16 @@ async function renderDetail(id) {
       alert('這場沒有逐字稿，無法問答');
       return;
     }
-    const btn = document.getElementById('chatAsk');
-    btn.disabled = true;
-    btn.textContent = '⏳ 思考中…';
+    if (detailBusy()) {
+      toast('已有一項作業進行中，請等它完成');
+      return;
+    }
     try {
-      const a = await askMeeting(m.transcript, m.summary, q, getApiKeyEntries(), {
-        onProgress: (info) => (btn.textContent = '⏳ ' + (info && info.message ? info.message : '思考中…')),
-      });
+      const a = await runDetailTask(id, 'ask', '思考中…', (setMsg) =>
+        askMeeting(m.transcript, m.summary, q, getApiKeyEntries(), {
+          onProgress: (info) => setMsg(info && info.message),
+        })
+      );
       await persist((fresh) => {
         fresh.chat = fresh.chat || [];
         fresh.chat.push({ q, a, at: Date.now() });
@@ -1395,9 +1606,6 @@ async function renderDetail(id) {
       chatLogEl.lastElementChild && chatLogEl.lastElementChild.scrollIntoView({ block: 'nearest' });
     } catch (e) {
       alert('問答失敗：' + (e && e.message ? e.message : e));
-    } finally {
-      btn.disabled = false;
-      btn.textContent = '送出問題';
     }
   };
 
@@ -1416,13 +1624,27 @@ async function renderDetail(id) {
   };
 
   drawBody('orig');
+  // 重繪後把仍在跑的作業狀態畫回按鈕（離開再回來時才看得出它還在跑）
+  paintDetailTasks();
 }
 
 function renderSettings() {
   setHeader('設定', true);
   const cfg = defaultSyncConfig();
   const enabled = sync.isEnabled();
+  // 這支 App 的網址（去掉 #hash 與 ?query）——PWA 從主畫面開啟時看不到網址列，
+  // 需要換裝置或分享給別人時，這裡是唯一拿得到網址的地方。
+  const appUrl = location.origin + location.pathname;
   view.innerHTML = `
+    <div class="card">
+      <p style="margin-top:0"><b>🔗 這個 App 的網址</b></p>
+      <input type="text" id="appUrl" value="${esc(appUrl)}" readonly />
+      <button class="big secondary" id="copyUrl" style="margin-top:8px">複製網址</button>
+      <div class="hint">
+        用這個網址可在電腦或其他手機開啟同一個 App（PWA 從主畫面開啟時看不到網址列，所以放在這裡）。<br>
+        會議記錄<b>不會</b>跟著網址走：每台裝置各自存在本機，要跨裝置看到同一份記錄，需開啟下方的 GitHub 雲端同步。
+      </div>
+    </div>
     <div class="card">
       <p style="margin-top:0"><b>Gemini API 金鑰</b></p>
       <div id="keyList"></div>
@@ -1489,6 +1711,20 @@ function renderSettings() {
   };
   const existingEntries = getApiKeyEntries();
   (existingEntries.length ? existingEntries : [{ name: '', key: '' }]).forEach(addRow);
+  document.getElementById('copyUrl').onclick = async (e) => {
+    const b = e.target;
+    try {
+      await navigator.clipboard.writeText(appUrl);
+      b.textContent = '已複製 ✓';
+    } catch (_) {
+      // iOS 在非使用者手勢或無 HTTPS 時可能失敗 → 退而求其次幫他選取，讓使用者長按複製
+      const f = document.getElementById('appUrl');
+      f.focus();
+      f.setSelectionRange(0, f.value.length);
+      b.textContent = '請長按上方網址複製';
+    }
+    setTimeout(() => (b.textContent = '複製網址'), 1800);
+  };
   document.getElementById('addKey').onclick = () => addRow({ name: '', key: '' });
   document.getElementById('saveKey').onclick = () => {
     const rows = Array.from(keyList.querySelectorAll('.key-row')).map((r) => ({
@@ -1582,7 +1818,9 @@ function renderSettings() {
 
 function router() {
   const h = location.hash || '#/';
+  refreshResumeBanner(); // 每次換頁都重算橫幅：辨識中離開進度頁時才會有回去的入口
   if (h.startsWith('#/m/')) return renderDetail(h.slice(4));
+  if (h === '#/job') return renderJob();
   if (h === '#/new') return renderNew();
   if (h === '#/settings') return renderSettings();
   if (h === '#/groups') return renderGroups();

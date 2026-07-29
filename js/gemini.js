@@ -23,6 +23,30 @@ export function resetThinkingFlag() {
   thinkingRejected = false;
 }
 
+// ---- 中斷（使用者按「停止辨識」）----
+// 停止必須立即生效：除了不再發新請求，連「等待重試」的睡眠也要能被打斷，
+// 否則按下停止後畫面還要卡完那 8～35 秒，跟當機沒兩樣。
+let aborted = false;
+const abortWaiters = new Set();
+export function requestAbort() {
+  aborted = true;
+  for (const w of Array.from(abortWaiters)) w();
+  abortWaiters.clear();
+}
+export function clearAbort() {
+  aborted = false;
+}
+export function isAborted() {
+  return aborted;
+}
+export const ABORT_MSG = '已停止這場辨識';
+function throwIfAborted() {
+  if (aborted) throw new Error(ABORT_MSG);
+}
+function isAbortError(e) {
+  return !!(e && e.message === ABORT_MSG);
+}
+
 // 動態挑選型號：向 API 詢問目前可用的模型，挑最適合的。
 // 這樣 Google 汰換型號名稱（如 2.5-flash → 3.5-flash）時 App 不會壞。
 export function pickModel(models, opts = {}) {
@@ -63,6 +87,7 @@ export function clearModelCache() {
 // apiKeys 可為單把字串或多把陣列 → 多把時逐把嘗試查型號（某把冷卻/失敗會換下一把）
 // opts.preferLite: 明確指定要不要用 Flash-Lite（辨識用全域設定；摘要/翻譯固定 false 品質優先）
 async function resolveModel(apiKeys, opts = {}) {
+  throwIfAborted();
   const lite = opts.preferLite != null ? opts.preferLite : preferLite;
   const ck = String(lite);
   if (modelCache[ck]) return modelCache[ck];
@@ -99,6 +124,7 @@ function report(onProgress, phase, pct, message, keyName) {
 }
 
 async function uploadFile(file, apiKey, onProgress) {
+  throwIfAborted();
   report(onProgress, 'upload', 5, '準備上傳…');
   const mime = file.type || 'audio/mpeg';
   const start = await fetch(`${BASE}/upload/v1beta/files?key=${apiKey}`, {
@@ -112,7 +138,11 @@ async function uploadFile(file, apiKey, onProgress) {
     },
     body: JSON.stringify({ file: { display_name: file.name || 'meeting-audio' } }),
   });
-  if (!start.ok) throw new Error(`上傳啟動失敗 (${start.status})：${(await start.text()).slice(0, 200)}`);
+  if (!start.ok) {
+    const err = new Error(`上傳啟動失敗 (${start.status})：${(await start.text()).slice(0, 200)}`);
+    err.status = start.status; // 供上層判斷是否值得重試
+    throw err;
+  }
   const uploadUrl = start.headers.get('X-Goog-Upload-URL');
   if (!uploadUrl) throw new Error('未取得上傳網址');
 
@@ -136,10 +166,16 @@ async function uploadFile(file, apiKey, onProgress) {
           reject(new Error('上傳回應解析失敗'));
         }
       } else {
-        reject(new Error(`上傳失敗 (${xhr.status})`));
+        const err = new Error(`上傳失敗 (${xhr.status})`);
+        err.status = xhr.status;
+        reject(err);
       }
     };
-    xhr.onerror = () => reject(new Error('上傳失敗（網路中斷）'));
+    xhr.onerror = () => {
+      const err = new Error('上傳失敗（網路中斷）');
+      err.status = 0; // 網路層錯誤，值得重試
+      reject(err);
+    };
     xhr.send(file);
   });
   return info; // { uri, name, state, mimeType }
@@ -165,7 +201,20 @@ async function waitActive(fileInfo, apiKey, onProgress) {
   return { uri, mimeType };
 }
 
-const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+// 可被中斷的睡眠：按下停止時立刻醒來，不必等完退避秒數
+const sleep = (ms) =>
+  new Promise((resolve) => {
+    if (aborted) return resolve();
+    const wake = () => {
+      clearTimeout(timer);
+      resolve();
+    };
+    const timer = setTimeout(() => {
+      abortWaiters.delete(wake);
+      resolve();
+    }, ms);
+    abortWaiters.add(wake);
+  });
 export function isTransientStatus(status) {
   return status === 429 || status === 500 || status === 502 || status === 503 || status === 504;
 }
@@ -193,6 +242,7 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
     let sawTransient = false;
     let retryMs = 0;
     for (let k = 0; k < vs.length; k++) {
+      throwIfAborted();
       const v = vs[vi % vs.length];
       vi++;
       const multi = vs.length > 1;
@@ -255,6 +305,7 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
     totalWait += wait;
     report(onProgress, 'transcribe', null, `${vs.length > 1 ? '所有金鑰' : '額度'}暫時受限，等待 ${Math.round(wait / 1000)} 秒後再試…`);
     await sleep(wait);
+    throwIfAborted();
   }
   if (lastStatus === 403 && /permission|not exist/i.test(lastText)) {
     throw new Error('雲端音檔已過期或無法存取，請按「新增會議」重新上傳這個檔案。');
@@ -404,6 +455,60 @@ function toKeyObjs(keys) {
     .filter((o) => o.key);
 }
 
+// 單把金鑰的上傳（含暫時性失敗重試）。
+// 沒有重試時，一次 429／5xx／網路瞬斷就會讓這把金鑰被踢出整場任務的輪替名單，
+// 之後辨識撞到額度上限只能乾等——這正是「有兩把金鑰卻不會切換」的根因。
+const UPLOAD_TRIES = 3;
+function isRetriableUpload(e) {
+  const s = e && e.status;
+  return s === 0 || s === 408 || s === 429 || (s >= 500 && s <= 599);
+}
+async function uploadOnce(file, ko, onProgress) {
+  let lastErr = null;
+  for (let attempt = 0; attempt < UPLOAD_TRIES; attempt++) {
+    throwIfAborted();
+    try {
+      const info = await uploadFile(file, ko.key, onProgress);
+      const active = await waitActive(info, ko.key, onProgress);
+      return active;
+    } catch (e) {
+      if (isAbortError(e)) throw e;
+      lastErr = e;
+      if (!isRetriableUpload(e) || attempt === UPLOAD_TRIES - 1) break;
+      const wait = 1500 * (attempt + 1);
+      report(onProgress, 'upload', null, `${ko.name || '金鑰'} 上傳失敗，${Math.round(wait / 1000)} 秒後重試…`);
+      await sleep(wait);
+    }
+  }
+  throw lastErr;
+}
+// 依序把音檔上傳到指定的每一把金鑰；單把失敗會明確回報（不再靜默略過）
+async function uploadToKeys(file, kos, onProgress, showIndex) {
+  const uploads = [];
+  let mime = file.type || 'audio/mpeg';
+  let lastErr = null;
+  for (let i = 0; i < kos.length; i++) {
+    throwIfAborted();
+    if (showIndex && kos.length > 1) report(onProgress, 'upload', 5, `上傳音檔中…（金鑰 ${i + 1}/${kos.length}）`, kos[i].name);
+    try {
+      const active = await uploadOnce(file, kos[i], onProgress);
+      uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
+      mime = active.mimeType || mime;
+    } catch (e) {
+      if (isAbortError(e)) throw e;
+      lastErr = e;
+      // 靜默略過會讓使用者以為還有多把金鑰在輪替 → 明確告知這場少了哪一把
+      report(onProgress, 'upload', null, `⚠️ ${kos[i].name || `金鑰${i + 1}`} 上傳失敗，本場將無法用它輪替`);
+    }
+  }
+  return { uploads, mime, lastErr };
+}
+// 找出還沒上傳過這個檔案的金鑰（續傳時用來補傳，恢復輪替能力）
+export function missingKeyEntries(uploads, apiKeys) {
+  const have = new Set((uploads || []).map((u) => u.key));
+  return toKeyObjs(apiKeys).filter((k) => !have.has(k.key));
+}
+
 // 把音檔上傳到「每一把金鑰的專案」，回傳 { model, mime, uploads:[{key,name,fileUri}] }
 // 這樣之後辨識輪替金鑰時，每把用自己的檔案，不會 403。
 export async function uploadForJob(file, apiKeys, onProgress) {
@@ -411,21 +516,7 @@ export async function uploadForJob(file, apiKeys, onProgress) {
   if (!kos.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
   report(onProgress, 'model', 3, '選擇辨識型號中…');
   const model = await resolveModel(kos.map((k) => k.key));
-  const uploads = [];
-  let mime = file.type || 'audio/mpeg';
-  let lastErr = null;
-  for (let i = 0; i < kos.length; i++) {
-    if (kos.length > 1) report(onProgress, 'upload', 5, `上傳音檔中…（金鑰 ${i + 1}/${kos.length}）`, kos[i].name);
-    try {
-      const info = await uploadFile(file, kos[i].key, onProgress);
-      const active = await waitActive(info, kos[i].key, onProgress);
-      uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
-      mime = active.mimeType || mime;
-    } catch (e) {
-      // 單把金鑰上傳失敗（打錯字/專案停用）不該拖垮整個任務 → 略過這把，只要有一把成功就繼續
-      lastErr = e;
-    }
-  }
+  const { uploads, mime, lastErr } = await uploadToKeys(file, kos, onProgress, true);
   if (!uploads.length) throw lastErr || new Error('音檔上傳失敗（所有金鑰皆無法使用）');
   return { model, mime, uploads };
 }
@@ -445,19 +536,7 @@ export async function pickModelForKeys(apiKeys, opts = {}) {
 export async function uploadBlobToKeys(blob, apiKeys, onProgress) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
-  const uploads = [];
-  let mime = blob.type || 'audio/mpeg';
-  let lastErr = null;
-  for (let i = 0; i < kos.length; i++) {
-    try {
-      const info = await uploadFile(blob, kos[i].key, onProgress);
-      const active = await waitActive(info, kos[i].key, onProgress);
-      uploads.push({ key: kos[i].key, name: kos[i].name, fileUri: active.uri });
-      mime = active.mimeType || mime;
-    } catch (e) {
-      lastErr = e; // 單把失敗略過，至少一把成功即可繼續
-    }
-  }
+  const { uploads, mime, lastErr } = await uploadToKeys(blob, kos, onProgress, false);
   if (!uploads.length) throw lastErr || new Error('音檔上傳失敗（所有金鑰皆無法使用）');
   return { uploads, mime };
 }
@@ -492,7 +571,7 @@ const SUMMARY_PROMPT =
   `以下是一段會議逐字稿。請依內容整理成三類，並使用「與逐字稿相同的主要語言」` +
   `（逐字稿主要是中文就用繁體中文、主要是英文就用英文、主要是日文就用日文）：\n` +
   `- actionItems（待辦事項）：逐條列出，每項結尾標註「[DRI: 負責人]」，判斷不出負責人就寫「[DRI: 待指派]」（英文用 [DRI: TBD]）。\n` +
-  `- mainPoints（會議重點）：逐條列出。\n` +
+  `- mainPoints（會議重點）：逐條列出，每條寫成「標題：說明」（標題為 4～14 字的名詞短語，接全形冒號再寫說明；英文用「Title: …」），每條只講一個議題。\n` +
   `- qa（提問／Q&A）：格式「問：… 答：…」（英文用「Q: … A: …」），若沒有問答就回傳空陣列。\n\n逐字稿：\n`;
 
 // 加強單一區塊：分段掃過整份逐字稿，抓出「完整、不遺漏」的清單（解決 Q&A 只有幾筆的問題）
@@ -500,11 +579,38 @@ const SECTION_META = {
   actionItems: {
     label: '待辦事項',
     instr: '逐條列出「所有」待辦／後續行動（action items），不要精簡、不要遺漏；每項結尾標「[DRI: 負責人]」，判斷不出就標「[DRI: 待指派]」（英文用 [DRI: TBD]）',
+    polishInstr: `- 每項結尾保留「[DRI: 負責人]」標註（英文用 [DRI: …]）；合併多條時，多位負責人可並列在同一個標註內。\n`,
   },
-  mainPoints: { label: '會議重點', instr: '逐條列出「所有」重要重點與結論，力求完整、不要精簡' },
+  mainPoints: {
+    label: '會議重點',
+    instr:
+      '逐條列出「所有」重要重點與結論，力求完整、不要精簡；每條寫成「標題：說明」的點列格式' +
+      '（標題為 4～14 字的名詞短語，點出這條在講什麼，後接全形冒號與說明；英文用「Title: 說明」）',
+    cap: 2,
+    polishInstr:
+      `- 每條必須是「標題：說明」的點列格式：先寫 4～14 字的名詞短語標題，接全形冒號，再寫說明（英文用「Title: …」）。不可寫成沒有標題的長篇論述。\n` +
+      `- 每條只講「一個」議題；不同議題（例如需求、技術優缺點、成本、市場數據）一律各自一條，不可壓縮成同一條。\n` +
+      `- 說明務必保留原始的具體資訊（數字、單位、比例、日期、人名、結論）。\n`,
+  },
   qa: {
     label: '會議提問 Q&A',
-    instr: '把逐字稿中「每一組」提問與回答都抓出來（務必全部、不要只挑幾個），格式「問：… 答：…」（英文用「Q: … A: …」）',
+    instr:
+      '把逐字稿中「每一組」提問與回答都抓出來（務必全部、不要只挑幾個），格式「問：… 答：…」（英文用「Q: … A: …」）。' +
+      '問題必須「離開逐字稿也看得懂」：把「此類形態」「這個」「那部分」「上述」等代名詞或指示詞，' +
+      '依上下文展開成具體名詞（例如「此類形態的產品」→「Brick 型態的伺服器電源」）；' +
+      '若上下文不足以完全確定所指，仍要依前後文做出最合理的推測，並在該詞後標註「（推測）」，不可原封不動留著看不懂的指示詞',
+    allowDrop: true, // 只有 Q&A 做價值篩選：議程性、寒暄、零資訊的問答不進會議記錄
+    polishInstr:
+      `- 維持「問：… 答：…」格式（英文用「Q: … A: …」）；針對同一議題的多組問答合併成一條，答案濃縮成重點結論。\n` +
+      `- 問題必須自足：仍帶有「此類」「這個」「那部分」等指涉不明的詞時，依清單其他條目的脈絡改寫成具體名詞；` +
+      `無法完全確定時，做出最合理的推測並標註「（推測）」，例如「問：Brick 型態的伺服器電源（推測）是否為貴司首款產品？」。\n` +
+      `- 價值篩選：把「不該進會議記錄」的條目標成 drop:true（text 留空字串）。符合以下任一即標 drop：\n` +
+      `  (a) 議程或流程安排（要不要先做簡介、能不能快速帶過、時間夠不夠、換下一頁、要不要休息）；\n` +
+      `  (b) 設備或連線確認（聽得到嗎、畫面有出來嗎）、純寒暄與出席確認；\n` +
+      `  (c) 答案只是複述問題或僅表示同意，問答雙方都沒有提供任何實質資訊。\n` +
+      `- 以下一律「不可」標 drop：涉及技術、規格、時程、成本、產能、商務條件、責任歸屬、風險的問答；` +
+      `答案為「尚未決定／待確認／再回覆」的也必須保留（那是有意義的狀態）。\n` +
+      `- 標 drop 應是少數；若你想標掉的超過三成，代表判斷過於嚴格，請重新檢視並只保留最明確的議程性條目。\n`,
   },
 };
 const ITEMS_SCHEMA = { type: 'object', properties: { items: { type: 'array', items: { type: 'string' } } }, required: ['items'] };
@@ -552,7 +658,114 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
     }
     if (Array.isArray(r.items)) all.push(...r.items);
   }
-  return all;
+  if (!all.length) return all;
+  return polishItems(all, meta, model, variants, onProgress);
+}
+
+// 第二階段：逐條改寫成書面語＋只合併「同一個問題／同一件事」的重複條目。
+// 模型須為每條輸出附上涵蓋的原始編號（src）；程式據此做保底——
+// 沒被涵蓋的原始條目自動補回、一條涵蓋太多（合併過頭）就拆回原文，確保永遠不會比抓全階段少內容。
+const MERGE_CAP = 3; // 一條輸出最多涵蓋幾條原始條目（各區可用 meta.cap 覆寫）
+const POLISH_SCHEMA = {
+  type: 'object',
+  properties: {
+    items: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          text: { type: 'string' },
+          src: { type: 'array', items: { type: 'integer' } },
+          drop: { type: 'boolean' }, // 僅 Q&A 使用：標記為不該進會議記錄的議程性／零資訊條目
+        },
+        required: ['text', 'src'],
+      },
+    },
+  },
+  required: ['items'],
+};
+
+async function polishItems(all, meta, model, variants, onProgress) {
+  const n = all.length;
+  const cap = meta.cap || MERGE_CAP;
+  const polishPrompt =
+    `以下是從會議逐字稿分批擷取的「${meta.label}」原始清單，共 ${n} 條（已編號）。請逐條改寫成正式會議記錄：\n` +
+    `- 每一條都改寫成精簡的書面語，刪除口語贅字（如「那個」「就是說」「嗯」），不要照抄逐字稿原文，但保留具體資訊（數字、日期、人名、結論）。\n` +
+    `- 只有當多條記錄的是「同一個問題／同一件事」（重複、追問、或同一件事分次提到）才可合併成一條；不同的問題即使屬於同一主題，也必須各自保留一條。合併是例外而非常態，輸出條數應與原始條數相近。\n` +
+    `- 一條輸出最多合併 ${cap} 條原始條目。\n` +
+    `- 每條輸出都要在 src 列出它涵蓋的原始編號；${n} 條原始編號每一條都必須被涵蓋，不可遺漏、不可自行新增內容。\n` +
+    `- 使用與原始清單相同的主要語言。\n` +
+    meta.polishInstr +
+    `只輸出 JSON {"items":[{"text":"...","src":[編號]}]}。\n\n原始清單：\n` +
+    all.map((s, i) => `${i + 1}. ${s}`).join('\n');
+  const res = await postJsonRotating(
+    variants,
+    (v) => ({
+      url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: polishPrompt }] }],
+        generationConfig: { responseMimeType: 'application/json', responseSchema: POLISH_SCHEMA, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
+      }),
+    }),
+    onProgress,
+    `整理潤飾${meta.label}中…`
+  );
+  const data = await res.json();
+  const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if (!out) throw new Error(`整理${meta.label}時無回應，請重試`);
+  let r;
+  try {
+    r = JSON.parse(out);
+  } catch (_) {
+    throw new Error(`整理${meta.label}時解析失敗，請重試`);
+  }
+  if (!Array.isArray(r.items)) throw new Error(`整理${meta.label}後結果為空，請重試`);
+
+  let built = assemblePolished(r.items, all, n, cap, !!meta.allowDrop);
+  // 過度篩選保護：略過太多就整批不採納，退回「只潤飾不篩選」。
+  // 門檻用 max(2, 40%) —— 條目少時比例天生浮動，不該因此觸發。
+  if (built.dropped > Math.max(2, n * 0.4) || !built.list.length) {
+    built = assemblePolished(r.items, all, n, cap, false);
+  }
+  if (!built.list.length) throw new Error(`整理${meta.label}後結果為空，請重試`);
+  // 讓呼叫端能顯示「另略過 N 則」，使篩選對使用者可見（不可列舉 → 不會被寫進 IndexedDB）
+  Object.defineProperty(built.list, 'dropped', { value: built.dropped, enumerable: false });
+  return built.list;
+}
+
+// 依模型回傳組出最終清單。honorDrop=false 時忽略所有 drop 標記（等於只潤飾不篩選）。
+// ord 取涵蓋的最小原始編號，以維持會議先後順序。
+function assemblePolished(items, all, n, cap, honorDrop) {
+  const covered = new Set();
+  const outs = [];
+  let dropped = 0;
+  for (const it of items) {
+    const isDrop = honorDrop && !!(it && it.drop === true);
+    const text = it && typeof it.text === 'string' ? it.text.trim() : '';
+    if (!isDrop && !text) continue;
+    const src = (Array.isArray(it && it.src) ? it.src : [])
+      .map((x) => Math.trunc(Number(x)))
+      .filter((x) => x >= 1 && x <= n && !covered.has(x));
+    if (!src.length) continue;
+    if (isDrop) {
+      src.forEach((x) => covered.add(x));
+      dropped += src.length;
+      continue;
+    }
+    if (src.length > cap) {
+      for (const x of src) {
+        covered.add(x);
+        outs.push({ ord: x, text: all[x - 1] });
+      }
+      continue;
+    }
+    src.forEach((x) => covered.add(x));
+    outs.push({ ord: Math.min(...src), text });
+  }
+  // 沒被涵蓋也沒被標略過的 → 補回原文（防漏保證不變）
+  for (let x = 1; x <= n; x++) if (!covered.has(x)) outs.push({ ord: x, text: all[x - 1] });
+  outs.sort((a, b) => a.ord - b.ord);
+  return { list: outs.map((o) => o.text), dropped };
 }
 
 // 問答：根據整份逐字稿+摘要回答使用者問題（純文字，固定品質模型）
