@@ -2,7 +2,7 @@
 // - PDF：開新視窗載入乾淨排版後呼叫列印（中文字體用系統字體最穩，iPhone 也能存成 PDF）。
 // - Word：產生 Word 可開啟的 .doc（HTML 格式），保留中文與排版、可再編輯。
 import { formatDate } from './format.js';
-import { buildDocxBytes } from './docx.js';
+import { buildDocxBytes, normalizeSections } from './docx.js';
 
 function esc(s) {
   return String(s == null ? '' : s).replace(/[&<>]/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;' }[c]));
@@ -57,24 +57,20 @@ export function safeFileName(title) {
   return (String(title || 'meeting').replace(/[\\/:*?"<>|]+/g, '_').trim() || 'meeting').slice(0, 80);
 }
 
-// 會議內容主體 HTML（PDF 用）
-export function meetingToHtmlBody(meeting) {
+// 會議內容主體 HTML（PDF 用）。opts 可關閉個別段落，例如 { actionItems: false }
+export function meetingToHtmlBody(meeting, opts) {
+  const want = normalizeSections(opts);
   const s = meeting.summary || {};
-  const actionItems = s.actionItems || [];
-  const mainPoints = s.mainPoints || s.keyPoints || [];
-  const qa = s.qa || [];
   const colors = speakerColorMap(meeting.transcript);
   const segs = (meeting.transcript || [])
     .map((seg) => `<p class="seg"><strong style="color:${colors[seg.speaker] || '#111'}">${esc(seg.speaker)}：</strong>${esc(seg.text)}</p>`)
     .join('');
-  return (
-    `<h1>${esc(meeting.title)}</h1>` +
-    `<p class="date">${esc(formatDate(meeting.createdAt))}</p>` +
-    `<h2>✅ 待辦事項 Action Item</h2>${ol(actionItems)}` +
-    `<h2>📌 會議重點 Main Point</h2>${ol(mainPoints)}` +
-    `<h2>❓ 會議提問 Q&amp;A</h2>${qaOl(qa)}` +
-    `<h2>🗣️ 逐字稿 Transcribe</h2>${segs || '<p class="none">（無逐字稿）</p>'}`
-  );
+  let html = `<h1>${esc(meeting.title)}</h1><p class="date">${esc(formatDate(meeting.createdAt))}</p>`;
+  if (want.actionItems) html += `<h2>✅ 待辦事項 Action Item</h2>${ol(s.actionItems || [])}`;
+  if (want.mainPoints) html += `<h2>📌 會議重點 Main Point</h2>${ol(s.mainPoints || s.keyPoints || [])}`;
+  if (want.qa) html += `<h2>❓ 會議提問 Q&amp;A</h2>${qaOl(s.qa || [])}`;
+  if (want.transcript) html += `<h2>🗣️ 逐字稿 Transcribe</h2>${segs || '<p class="none">（無逐字稿）</p>'}`;
+  return html;
 }
 
 const STYLE = `
@@ -87,11 +83,11 @@ const STYLE = `
   @media print{ body{margin:0;} }
 `;
 
-export function fullHtmlDoc(meeting) {
+export function fullHtmlDoc(meeting, opts) {
   return (
     `<!doctype html><html lang="zh-Hant"><head><meta charset="utf-8">` +
     `<title>${esc(meeting.title)}</title><style>${STYLE}</style></head>` +
-    `<body>${meetingToHtmlBody(meeting)}</body></html>`
+    `<body>${meetingToHtmlBody(meeting, opts)}</body></html>`
   );
 }
 
@@ -105,15 +101,15 @@ function downloadBlob(blob, filename) {
   URL.revokeObjectURL(a.href);
 }
 
-export function exportWord(meeting) {
+export function exportWord(meeting, opts) {
   // 產生真正的 .docx（Office Open XML），各平台可正常開啟。
-  const blob = new Blob([buildDocxBytes(meeting)], {
+  const blob = new Blob([buildDocxBytes(meeting, opts)], {
     type: 'application/vnd.openxmlformats-officedocument.wordprocessingml.document',
   });
   downloadBlob(blob, safeFileName(meeting.title) + '.docx');
 }
 
-export function exportPdf(meeting) {
+export function exportPdf(meeting, opts) {
   // 在「原頁面」列印（不開新分頁，印完即回到 App）。
   // iOS 會出現列印預覽，可用分享鈕存成 PDF；桌機列印可選「另存為 PDF」。
   let root = document.getElementById('print-root');
@@ -122,9 +118,14 @@ export function exportPdf(meeting) {
     root.id = 'print-root';
     document.body.appendChild(root);
   }
-  root.innerHTML = meetingToHtmlBody(meeting);
+  root.innerHTML = meetingToHtmlBody(meeting, opts);
+  // 存成 PDF 的預設檔名來自 document.title（不像 Word 可以自己指定），
+  // 所以列印期間先把它換成會議名稱，印完再換回來。
+  const prevTitle = document.title;
+  document.title = safeFileName(meeting.title);
   const cleanup = () => {
     root.innerHTML = '';
+    document.title = prevTitle;
     window.removeEventListener('afterprint', cleanup);
   };
   window.addEventListener('afterprint', cleanup);

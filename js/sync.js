@@ -143,7 +143,8 @@ function authHeaders(c) {
 export async function pull() {
   const c = getSyncConfig();
   if (!c) throw new Error('尚未設定雲端同步');
-  const res = await fetch(apiUrl(c), { headers: authHeaders(c) });
+  // cache:'no-store'：同步一定要讀到最新狀態，且下面的 raw 重抓絕不能命中這次的快取（見該處說明）
+  const res = await fetch(apiUrl(c), { headers: authHeaders(c), cache: 'no-store' });
   if (res.status === 404) return { doc: { meetings: [], deleted: [], deletedAt: {}, groups: [], groupsDeleted: [], groupsDeletedAt: {} }, sha: null };
   if (res.status === 401) throw new Error('GitHub 權杖無效或已過期');
   if (!res.ok) throw new Error(`雲端讀取失敗 (${res.status})`);
@@ -156,9 +157,14 @@ export async function pull() {
   if (data.content && data.encoding === 'base64') {
     raw = b64decodeUtf8(data.content);
   } else {
-    // 空內容或大檔 → 用 raw media type 重新抓一次
-    const rawRes = await fetch(apiUrl(c), {
+    // 空內容或大檔 → 用 raw media type 重新抓一次。
+    // ⚠️ 這次請求「必須」換一個網址：GitHub 的回應帶 cache-control: max-age=60 卻沒有
+    // Vary: Accept，瀏覽器會把上面那次（同網址）的回應直接餵回來——也就是那份沒有
+    // meetings 的 metadata JSON，結果被誤判成「雲端資料格式異常」而整個同步中止。
+    // 加上時間戳讓快取鍵不同，再配合 no-store 雙重保險（iOS Safari 的 cache 模式不一定可靠）。
+    const rawRes = await fetch(`${apiUrl(c)}${apiUrl(c).includes('?') ? '&' : '?'}_=${Date.now()}`, {
       headers: { ...authHeaders(c), Accept: 'application/vnd.github.raw+json' },
+      cache: 'no-store',
     });
     if (!rawRes.ok) throw new Error(`雲端讀取失敗 (raw ${rawRes.status})`);
     raw = await rawRes.text();
@@ -172,7 +178,12 @@ export async function pull() {
     throw new Error('雲端資料解析失敗，為保護資料已中止同步（請稍後再試）');
   }
   if (!doc || typeof doc !== 'object' || !Array.isArray(doc.meetings)) {
-    throw new Error('雲端資料格式異常，為保護資料已中止同步');
+    // 拿到的其實是 GitHub 的檔案資訊而非檔案內容 → 幾乎必然是上面說的快取問題
+    if (doc && typeof doc === 'object' && doc.sha && 'encoding' in doc) {
+      throw new Error('讀到的是檔案資訊而非內容（瀏覽器快取問題），請重新整理頁面後再同步一次');
+    }
+    const keys = doc && typeof doc === 'object' ? Object.keys(doc).slice(0, 5).join(',') : typeof doc;
+    throw new Error(`雲端資料格式異常（收到：${keys}），為保護資料已中止同步`);
   }
   doc.meetings = doc.meetings || [];
   doc.deleted = doc.deleted || [];

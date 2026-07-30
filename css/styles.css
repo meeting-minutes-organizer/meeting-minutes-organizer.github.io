@@ -195,6 +195,7 @@ ol.list.qa li { margin: 10px 0; }
 .sheet-btn { display: block; width: 100%; text-align: left; padding: 13px 14px; margin-bottom: 8px; border: 1px solid var(--line); border-radius: 11px; background: var(--bg); color: var(--ink); font-size: 15px; font-weight: 600; }
 .sheet-btn.cur { border-color: var(--brand); color: var(--brand); }
 .sheet-btn.cancel { text-align: center; color: var(--muted); background: transparent; }
+.sheet-btn.primary { text-align: center; background: var(--brand); color: #fff; border-color: var(--brand); }
 .sheet-btn:active { transform: scale(0.99); }
 
 /* ---- 區塊摺疊 + 條目跳出處 ---- */

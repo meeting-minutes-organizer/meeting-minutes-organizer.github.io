@@ -82,7 +82,16 @@ function splitQA(item) {
   return { q: s.replace(/^\s*問\s*[：:]\s*/, '').trim(), a: '' };
 }
 
-function documentXml(meeting) {
+// 匯出要包含哪些段落；未指定的一律視為要（保持舊行為）。
+// 放在這裡而非 export.js，是因為 export.js 已經 import 本模組，反向 import 會形成循環相依。
+export function normalizeSections(opts) {
+  const o = opts || {};
+  const on = (v) => v !== false;
+  return { actionItems: on(o.actionItems), mainPoints: on(o.mainPoints), qa: on(o.qa), transcript: on(o.transcript) };
+}
+
+function documentXml(meeting, opts) {
+  const want = normalizeSections(opts);
   const s = meeting.summary || {};
   const actionItems = s.actionItems || [];
   const mainPoints = s.mainPoints || s.keyPoints || [];
@@ -91,35 +100,43 @@ function documentXml(meeting) {
   const body = [];
   body.push(title(meeting.title || '會議記錄'));
   body.push(line(dateStr, 18));
-  body.push(heading('✅ 待辦事項 Action Item'));
-  if (actionItems.length) actionItems.forEach((x, i) => body.push(line(`${i + 1}. ${x}`)));
-  else body.push(line('（無）'));
-  body.push(heading('📌 會議重點 Main Point'));
-  if (mainPoints.length) mainPoints.forEach((x, i) => body.push(line(`${i + 1}. ${x}`)));
-  else body.push(line('（無）'));
-  body.push(heading('❓ 會議提問 Q&A'));
-  if (qa.length) {
-    qa.forEach((x, i) => {
-      const { q, a } = splitQA(x);
-      // 問與答同段、以換行分隔，並設 keepLines 讓整組不被分頁拆開（跟 PDF 一致）
-      let runs = run(`${i + 1}. `, { b: true }) + run('問：', { b: true, color: '0A58CA' }) + run(q);
-      if (a) runs += '<w:r><w:br/></w:r>' + run('答：', { b: true, color: '1A7F37' }) + run(a);
-      body.push(para(runs, '<w:keepLines/>'));
-    });
-  } else body.push(line('無'));
-  body.push(heading('🗣️ 逐字稿 Transcribe'));
-  const segs = meeting.transcript || [];
-  if (segs.length) {
-    const colorMap = {};
-    let ci = 0;
-    segs.forEach((seg) => {
-      if (!(seg.speaker in colorMap)) {
-        colorMap[seg.speaker] = SPK_COLORS[ci % SPK_COLORS.length];
-        ci++;
-      }
-      body.push(para(run(`${seg.speaker}：`, { b: true, color: colorMap[seg.speaker] }) + run(seg.text)));
-    });
-  } else body.push(line('（無逐字稿）'));
+  if (want.actionItems) {
+    body.push(heading('✅ 待辦事項 Action Item'));
+    if (actionItems.length) actionItems.forEach((x, i) => body.push(line(`${i + 1}. ${x}`)));
+    else body.push(line('（無）'));
+  }
+  if (want.mainPoints) {
+    body.push(heading('📌 會議重點 Main Point'));
+    if (mainPoints.length) mainPoints.forEach((x, i) => body.push(line(`${i + 1}. ${x}`)));
+    else body.push(line('（無）'));
+  }
+  if (want.qa) {
+    body.push(heading('❓ 會議提問 Q&A'));
+    if (qa.length) {
+      qa.forEach((x, i) => {
+        const { q, a } = splitQA(x);
+        // 問與答同段、以換行分隔，並設 keepLines 讓整組不被分頁拆開（跟 PDF 一致）
+        let runs = run(`${i + 1}. `, { b: true }) + run('問：', { b: true, color: '0A58CA' }) + run(q);
+        if (a) runs += '<w:r><w:br/></w:r>' + run('答：', { b: true, color: '1A7F37' }) + run(a);
+        body.push(para(runs, '<w:keepLines/>'));
+      });
+    } else body.push(line('無'));
+  }
+  if (want.transcript) {
+    body.push(heading('🗣️ 逐字稿 Transcribe'));
+    const segs = meeting.transcript || [];
+    if (segs.length) {
+      const colorMap = {};
+      let ci = 0;
+      segs.forEach((seg) => {
+        if (!(seg.speaker in colorMap)) {
+          colorMap[seg.speaker] = SPK_COLORS[ci % SPK_COLORS.length];
+          ci++;
+        }
+        body.push(para(run(`${seg.speaker}：`, { b: true, color: colorMap[seg.speaker] }) + run(seg.text)));
+      });
+    } else body.push(line('（無逐字稿）'));
+  }
 
   return (
     '<?xml version="1.0" encoding="UTF-8" standalone="yes"?>' +
@@ -144,10 +161,10 @@ const RELS =
   '<Relationship Id="rId1" Type="http://schemas.openxmlformats.org/officeDocument/2006/relationships/officeDocument" Target="word/document.xml"/>' +
   '</Relationships>';
 
-export function buildDocxBytes(meeting) {
+export function buildDocxBytes(meeting, opts) {
   return zipStore([
     { name: '[Content_Types].xml', bytes: enc.encode(CONTENT_TYPES) },
     { name: '_rels/.rels', bytes: enc.encode(RELS) },
-    { name: 'word/document.xml', bytes: enc.encode(documentXml(meeting)) },
+    { name: 'word/document.xml', bytes: enc.encode(documentXml(meeting, opts)) },
   ]);
 }

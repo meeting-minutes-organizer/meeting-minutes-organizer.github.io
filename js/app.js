@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v53';
+const APP_VERSION = 'v55';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -161,6 +161,58 @@ async function runDetailTask(meetingId, key, initialLabel, fn) {
     detailTasks.delete(k);
     paintDetailTasks();
   }
+}
+
+// 匯出時要包含哪些段落（記住上次的選擇，通常每次都一樣）
+const EXPORT_SEC_KEY = 'export_sections';
+const EXPORT_SECTIONS = [
+  { k: 'actionItems', label: '✅ 待辦事項 Action Item' },
+  { k: 'mainPoints', label: '📌 會議重點 Main Point' },
+  { k: 'qa', label: '❓ 會議提問 Q&A' },
+  { k: 'transcript', label: '🗣️ 逐字稿 Transcribe' },
+];
+function getExportSections() {
+  try {
+    const o = JSON.parse(localStorage.getItem(EXPORT_SEC_KEY)) || {};
+    return EXPORT_SECTIONS.reduce((a, s) => ((a[s.k] = o[s.k] !== false), a), {});
+  } catch (_) {
+    return EXPORT_SECTIONS.reduce((a, s) => ((a[s.k] = true), a), {});
+  }
+}
+// 匯出前選段落；回傳選項物件，取消則回傳 null
+function pickExportSections(kind) {
+  return new Promise((resolve) => {
+    const cur = getExportSections();
+    const ov = document.createElement('div');
+    ov.className = 'sheet-ov';
+    ov.innerHTML = `<div class="sheet">
+      <div class="sheet-title">匯出${esc(kind)}：要包含哪些段落？</div>
+      ${EXPORT_SECTIONS.map(
+        (s) => `<label class="sheet-btn"><input type="checkbox" data-k="${s.k}"${cur[s.k] ? ' checked' : ''} style="margin-right:10px">${s.label}</label>`
+      ).join('')}
+      <button class="sheet-btn primary" id="expGo">開始匯出</button>
+      <button class="sheet-btn cancel" id="expCancel">取消</button>
+    </div>`;
+    document.body.appendChild(ov);
+    const close = (v) => {
+      ov.remove();
+      resolve(v);
+    };
+    ov.onclick = (e) => {
+      if (e.target === ov) close(null);
+    };
+    document.getElementById('expCancel').onclick = () => close(null);
+    document.getElementById('expGo').onclick = () => {
+      const picked = {};
+      ov.querySelectorAll('input[data-k]').forEach((c) => (picked[c.dataset.k] = c.checked));
+      if (!Object.values(picked).some(Boolean)) {
+        alert('至少要選一個段落');
+        return;
+      }
+      localStorage.setItem(EXPORT_SEC_KEY, JSON.stringify(picked));
+      close(picked);
+    };
+  });
 }
 
 // 辨識中防止誤關頁面
@@ -1298,8 +1350,14 @@ async function renderDetail(id) {
   };
   document.querySelectorAll('#langToggle button').forEach((b) => (b.onclick = () => setLang(b.dataset.l)));
 
-  document.getElementById('pdfBtn').onclick = () => exportPdf(viewMeeting());
-  document.getElementById('wordBtn').onclick = () => exportWord(viewMeeting());
+  document.getElementById('pdfBtn').onclick = async () => {
+    const opts = await pickExportSections('PDF');
+    if (opts) exportPdf(viewMeeting(), opts);
+  };
+  document.getElementById('wordBtn').onclick = async () => {
+    const opts = await pickExportSections('Word');
+    if (opts) exportWord(viewMeeting(), opts);
+  };
 
   // ---- 專有名詞訂正 ----
   // 摺疊狀態（沿用逐字稿等區塊的 localStorage 'sec_collapsed'）；此區預設收合
