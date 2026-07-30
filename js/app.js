@@ -10,7 +10,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v56';
+const APP_VERSION = 'v57';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1352,7 +1352,9 @@ async function renderDetail(id) {
 
   document.getElementById('pdfBtn').onclick = async () => {
     const opts = await pickExportSections('PDF');
-    if (opts) exportPdf(viewMeeting(), opts);
+    if (!opts) return;
+    // iOS 主畫面 App 無法控制列印檔名 → 改開 Safari 分頁，需要告知使用者接下來怎麼做
+    if (exportPdf(viewMeeting(), opts) === 'newtab') toast('已在 Safari 開啟，請用分享鈕 → 列印 → 儲存 PDF');
   };
   document.getElementById('wordBtn').onclick = async () => {
     const opts = await pickExportSections('Word');

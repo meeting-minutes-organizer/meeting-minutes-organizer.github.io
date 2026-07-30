@@ -109,7 +109,46 @@ export function exportWord(meeting, opts) {
   downloadBlob(blob, safeFileName(meeting.title) + '.docx');
 }
 
+// iOS 從「主畫面圖示」開啟時是 standalone 模式，列印工作的名稱取自 manifest 的 App 名稱，
+// 完全不理會 document.title → 存出來永遠叫 DD會議紀錄.pdf。桌機瀏覽器則正常使用 document.title。
+export function isStandaloneIOS() {
+  const ua = navigator.userAgent || '';
+  const ios = /iPad|iPhone|iPod/.test(ua) || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+  const standalone =
+    navigator.standalone === true ||
+    (typeof window.matchMedia === 'function' && window.matchMedia('(display-mode: standalone)').matches);
+  return ios && standalone;
+}
+
+// standalone iOS 專用：把內容開在一般 Safari 分頁再列印，那裡的列印名稱才會用網頁標題。
+// 開不了新分頁（被擋）就回傳 false，交回原本的就地列印。
+function printViaNewTab(meeting, opts) {
+  let w = null;
+  try {
+    w = window.open('', '_blank');
+  } catch (_) {
+    return false;
+  }
+  if (!w || !w.document) return false;
+  try {
+    const hint =
+      `<div class="tip">👆 請按 Safari 的<b>分享鈕</b> → <b>列印</b> → 再用分享鈕儲存 PDF。` +
+      `<br>檔名會是「${esc(safeFileName(meeting.title))}」。</div>`;
+    w.document.write(
+      fullHtmlDoc(meeting, opts).replace(
+        '<body>',
+        `<body><style>.tip{background:#fff8e1;border:1px solid #ffe0a3;border-radius:10px;padding:10px 12px;margin:0 0 14px;font-size:14px;line-height:1.6}@media print{.tip{display:none}}</style>${hint}`
+      )
+    );
+    w.document.close();
+    return true;
+  } catch (_) {
+    return false;
+  }
+}
+
 export function exportPdf(meeting, opts) {
+  if (isStandaloneIOS() && printViaNewTab(meeting, opts)) return 'newtab';
   // 在「原頁面」列印（不開新分頁，印完即回到 App）。
   // iOS 會出現列印預覽，可用分享鈕存成 PDF；桌機列印可選「另存為 PDF」。
   let root = document.getElementById('print-root');
