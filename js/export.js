@@ -119,15 +119,25 @@ export function exportPdf(meeting, opts) {
     document.body.appendChild(root);
   }
   root.innerHTML = meetingToHtmlBody(meeting, opts);
-  // 存成 PDF 的預設檔名來自 document.title（不像 Word 可以自己指定），
-  // 所以列印期間先把它換成會議名稱，印完再換回來。
+  // 存成 PDF 的預設檔名來自 document.title（不像 Word 可以直接指定），列印期間換成會議名稱。
+  // ⚠️ 不能綁 afterprint 還原：iOS Safari 在使用者真正按下「儲存到檔案」之前就會觸發它，
+  // 太早還原檔名就會變回 App 標題（DD會議紀錄.pdf）。改成等使用者回到 App 有實際操作時
+  // 才還原，並設長逾時保險。標題在 PWA 全螢幕下看不到，暫時維持會議名稱沒有副作用。
   const prevTitle = document.title;
   document.title = safeFileName(meeting.title);
-  const cleanup = () => {
+  let restored = false;
+  const restore = () => {
+    if (restored) return;
+    restored = true;
+    clearTimeout(timer);
+    document.removeEventListener('pointerdown', onInteract, true);
+    document.removeEventListener('keydown', onInteract, true);
     root.innerHTML = '';
     document.title = prevTitle;
-    window.removeEventListener('afterprint', cleanup);
   };
-  window.addEventListener('afterprint', cleanup);
+  const onInteract = () => setTimeout(restore, 0);
+  const timer = setTimeout(restore, 5 * 60 * 1000);
+  document.addEventListener('pointerdown', onInteract, true);
+  document.addEventListener('keydown', onInteract, true);
   window.print();
 }
