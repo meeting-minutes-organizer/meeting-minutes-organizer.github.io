@@ -131,14 +131,26 @@ function printViaNewTab(meeting, opts) {
   }
   if (!w || !w.document) return false;
   try {
-    const hint =
-      `<div class="tip">👆 請按 Safari 的<b>分享鈕</b> → <b>列印</b> → 再用分享鈕儲存 PDF。` +
-      `<br>檔名會是「${esc(safeFileName(meeting.title))}」。</div>`;
+    // ⚠️ iOS 從主畫面 App 開的新視窗「沒有 Safari 工具列」——沒有分享鈕、也沒有返回。
+    // 所以這一頁必須自備「列印」與「關閉」按鈕，否則使用者會卡在這裡出不去。
+    const bar =
+      `<div class="bar">` +
+      `<button type="button" onclick="window.print()">🖨️ 列印／儲存 PDF</button>` +
+      `<button type="button" class="sec" onclick="window.close()">✕ 關閉</button>` +
+      `</div>` +
+      `<div class="tip">點上方<b>列印／儲存 PDF</b>，在預覽畫面用<b>分享鈕</b>存檔。` +
+      `<br>檔名會是「${esc(safeFileName(meeting.title))}」。<br>完成後點<b>關閉</b>回到 App。</div>`;
+    const barCss =
+      `.bar{position:sticky;top:0;background:#fff;padding:10px 0 8px;display:flex;gap:8px;` +
+      `border-bottom:1px solid #eee;margin-bottom:12px;z-index:9}` +
+      `.bar button{flex:1;padding:14px;font-size:16px;font-weight:700;border:none;border-radius:12px;` +
+      `background:#0a84ff;color:#fff}` +
+      `.bar button.sec{flex:0 0 96px;background:#eee;color:#111}` +
+      `.tip{background:#fff8e1;border:1px solid #ffe0a3;border-radius:10px;padding:10px 12px;` +
+      `margin:0 0 14px;font-size:14px;line-height:1.6}` +
+      `@media print{.bar,.tip{display:none!important}}`;
     w.document.write(
-      fullHtmlDoc(meeting, opts).replace(
-        '<body>',
-        `<body><style>.tip{background:#fff8e1;border:1px solid #ffe0a3;border-radius:10px;padding:10px 12px;margin:0 0 14px;font-size:14px;line-height:1.6}@media print{.tip{display:none}}</style>${hint}`
-      )
+      fullHtmlDoc(meeting, opts).replace('<body>', `<body><style>${barCss}</style>${bar}`)
     );
     w.document.close();
     return true;
