@@ -2,6 +2,7 @@ import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
 import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, requestAbort, clearAbort, isAborted, missingKeyEntries } from './gemini.js';
+import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
@@ -10,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v59';
+const APP_VERSION = 'v60';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -714,10 +715,9 @@ async function processJob(job) {
   transcribing = true;
   jobRunning = true;
   refreshResumeBanner();
-  let wakeLock = null;
-  try {
-    if ('wakeLock' in navigator) wakeLock = await navigator.wakeLock.request('screen');
-  } catch (_) {}
+  // 螢幕恆亮：畫面一暗頁面就被系統暫停、運算中斷。
+  // 系統會在切到背景時自動收走這把鎖，wakelock 模組負責回前景時重新申請。
+  await wakeLock.start();
   const prepared = () => job.chunks && job.chunks.length && job.chunks.every((c) => c.uploads && c.uploads.length);
   try {
     // 1) 準備（上傳；單檔會嘗試切割）——只在尚未備妥時做，需要原始檔（一次前景完成）
@@ -850,11 +850,7 @@ async function processJob(job) {
     }
     refreshResumeBanner();
   } finally {
-    if (wakeLock) {
-      try {
-        await wakeLock.release();
-      } catch (_) {}
-    }
+    await wakeLock.stop();
   }
 }
 
@@ -864,6 +860,11 @@ function paintJobShell() {
   view.innerHTML = `
     <div class="card">
       <div class="warn">辨識進行中。你可以<b>在 App 內</b>切到清單、設定等其他畫面去忙別的，它會<b>繼續跑</b>，隨時點畫面上方的橫幅就能回到這裡；只有<b>切出 App</b>（回主畫面或切到別的 App）才會中斷，回來會從這裡接續（iPhone 無法讓網頁在背景繼續運算）。</div>
+      ${
+        wakeLock.isSupported()
+          ? '<div class="hint" style="margin-top:8px">🔆 辨識期間會<b>維持螢幕恆亮</b>，放著不動也不會因為變暗而中斷。</div>'
+          : '<div class="warn" style="margin-top:8px">⚠️ 這台裝置不支援自動恆亮。螢幕變暗會中斷辨識，請先到<b>設定 → 螢幕顯示與亮度 → 自動鎖定</b>改成<b>永不</b>，或期間偶爾點一下螢幕。</div>'
+      }
       <div class="progress" id="jobprog"></div>
       <button class="big danger" id="stopJob" style="margin-top:14px">■ 停止辨識</button>
       <div class="hint" style="margin-top:6px">停止後已完成的段落會保留，之後可從中斷處繼續。</div>
