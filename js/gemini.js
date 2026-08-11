@@ -6,7 +6,7 @@
 // - maxOutputTokens 開到上限 65535，容納長逐字稿。
 // - responseSchema 強制結構化輸出，segments 陣列做語者辨識。
 
-import { recordUse, recordCooldown } from './usage.js';
+import { recordUse, recordCooldown, getKeyStatus } from './usage.js';
 
 const BASE = 'https://generativelanguage.googleapis.com';
 
@@ -224,6 +224,24 @@ export function parseRetryDelayMs(bodyText) {
   return m ? Math.min(65000, Math.ceil(parseFloat(m[1]) + 1) * 1000) : 0;
 }
 
+// 跨請求的輪替游標。少了它，每個請求都從第一把金鑰開始（只有前一把失敗才換下一把），
+// 於是第三把幾乎永遠用不到，前面幾把卻不斷撞每分鐘上限。
+let rrCursor = 0;
+export function resetKeyRotation() {
+  rrCursor = 0;
+}
+// 決定這次請求的嘗試順序：先輪替起點分散負載，再把「已知還在冷卻」的排到最後
+// （冷卻資訊本來只拿來顯示，沒用在選鑰上 → 明知會 429 還是先打它，白白浪費一次呼叫）。
+function orderVariants(vs) {
+  if (vs.length < 2) return vs.slice();
+  const start = rrCursor++ % vs.length;
+  const rotated = vs.slice(start).concat(vs.slice(0, start));
+  return rotated
+    .map((v, i) => ({ v, i, cool: v.key ? getKeyStatus(v.key).cooling : 0 }))
+    .sort((a, b) => (a.cool === b.cool ? a.i - b.i : a.cool - b.cool))
+    .map((x) => x.v);
+}
+
 // 帶自動重試 + 多變體（金鑰/檔案）輪替的 POST：
 // variants: 陣列，makeReq(variant) → { url, body }
 // - 某變體 429/5xx/網路錯 → 立刻換下一個變體重試（多把金鑰各有各的每分鐘額度、各自的檔案）
@@ -231,7 +249,7 @@ export function parseRetryDelayMs(bodyText) {
 async function postJsonRotating(variants, makeReq, onProgress, label) {
   // 錯誤訊息用當前動作命名（摘要/翻譯/問答/加強/辨識），不再一律寫「辨識失敗」誤導
   const act = (label || '處理').replace(/[…\.]+$/, '').replace(/中$/, '') || '處理';
-  const vs = variants && variants.length ? variants : [{}];
+  const vs = orderVariants(variants && variants.length ? variants : [{}]);
   const MAX_ROUNDS = 4;
   const MAX_TOTAL_WAIT = 150000; // 累計等待超過 ~2.5 分鐘就放棄（避免無限迴圈）
   let totalWait = 0;
