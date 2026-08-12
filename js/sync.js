@@ -51,6 +51,41 @@ function mergeChat(a, b) {
 
 // 合併同一場會議的兩個版本：主體（逐字稿/摘要/標題）取 editStamp 較新者，
 // 聊天做聯集，翻譯只在同一逐字稿版本（editStamp 相同）時互補。
+// 專有名詞訂正的欄位級合併。
+// 草稿（draft）是「只存本機、不上雲」的暫存資料：若 terms 整包由 editStamp 較新的一邊決定，
+// 只要對方那份較新（例如另一台裝置動過、或雲端剛被別的操作更新），使用者做到一半的草稿就會
+// 被整包蓋掉、「套用全部訂正」按鈕跟著消失。因此改成逐詞聯集，草稿與已套用結果都不會遺失。
+function mergeTerms(baseT, otherT) {
+  const bItems = (baseT && baseT.items) || [];
+  const oItems = (otherT && otherT.items) || [];
+  if (!baseT && !otherT) return null;
+  const map = new Map();
+  for (const it of [...oItems, ...bItems]) {
+    // base 後放 → 同一個詞以 base 為準，但草稿與已套用結果採「誰有就留誰」
+    if (!it || !it.t) continue;
+    const prev = map.get(it.t);
+    map.set(
+      it.t,
+      prev
+        ? { ...prev, ...it, draft: it.draft || prev.draft, applied: it.applied || prev.applied }
+        : { ...it }
+    );
+  }
+  const items = Array.from(map.values()).map((it) => {
+    // 草稿與已套用結果相同 → 這筆已經生效，不必再留草稿
+    if (it.draft && it.applied && it.draft === it.applied) {
+      const c = { ...it };
+      delete c.draft;
+      return c;
+    }
+    return it;
+  });
+  const scannedAt = Math.max((baseT && baseT.scannedAt) || 0, (otherT && otherT.scannedAt) || 0);
+  const out = { ...(otherT || {}), ...(baseT || {}), items };
+  if (scannedAt) out.scannedAt = scannedAt;
+  return out;
+}
+
 function mergeMeeting(a, b) {
   if (!a) return b;
   if (!b) return a;
@@ -59,6 +94,8 @@ function mergeMeeting(a, b) {
   const merged = { ...base };
   const chat = mergeChat(a.chat, b.chat);
   if (chat.length) merged.chat = chat;
+  const terms = mergeTerms(base.terms, other.terms);
+  if (terms) merged.terms = terms;
   if (editStamp(a) === editStamp(b)) {
     // 同一逐字稿版本 → 兩邊翻譯互補（base 優先）
     merged.translations = { ...(other.translations || {}), ...(base.translations || {}) };
