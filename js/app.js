@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v61';
+const APP_VERSION = 'v62';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -253,7 +253,7 @@ async function syncNow(silent) {
     };
     let remote = await sync.pull();
     let merged = mergeState(await localState(), remote.doc);
-    await applyMerged(merged);
+    await applyMerged(merged, sync.mergeMeeting);
     applyGroups(merged);
     try {
       await sync.push(merged, remote.sha);
@@ -261,7 +261,7 @@ async function syncNow(silent) {
       if (e.message === 'CONFLICT') {
         remote = await sync.pull();
         merged = mergeState(await localState(), remote.doc);
-        await applyMerged(merged);
+        await applyMerged(merged, sync.mergeMeeting);
         applyGroups(merged);
         await sync.push(merged, remote.sha);
       } else {
@@ -483,7 +483,7 @@ async function importBackup(file) {
     groupsDeleted: doc.groupsDeleted || [],
     groupsDeletedAt: doc.groupsDeletedAt || {},
   });
-  await applyMerged(merged);
+  await applyMerged(merged, sync.mergeMeeting);
   setGroups(merged.groups || []);
   setGroupTombstones(merged.groupsDeleted || []);
   setGroupTombstoneTimes(merged.groupsDeletedAt || {});

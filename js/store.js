@@ -118,7 +118,31 @@ export function setTombstoneTimes(map) {
 }
 
 // 把雲端合併後的文件套用到本機：刪掉墓碑內的、寫入所有會議、更新墓碑。
-export async function applyMerged(doc) {
+// 在同一個 transaction 內「先讀當下的本機版本、合併後再寫」，
+// 避免整批寫回時把同步期間才存進來的變更蓋掉。
+function putMergedOne(m, mergeFn) {
+  return openDb().then(
+    (db) =>
+      new Promise((resolve, reject) => {
+        const tx = db.transaction(STORE, 'readwrite');
+        const os = tx.objectStore(STORE);
+        const g = os.get(m.id);
+        g.onsuccess = () => {
+          const cur = g.result;
+          os.put(cur && mergeFn ? mergeFn(cur, m) : m);
+        };
+        tx.oncomplete = () => resolve();
+        tx.onerror = () => reject(tx.error);
+        tx.onabort = () => reject(tx.error);
+      })
+  );
+}
+
+// doc：合併後要落地的狀態。mergeFn（選用）：寫回前與當下本機版本再合併一次。
+// 同步流程是「讀快照 → 網路往返 → 整批寫回」，中間可能隔好幾秒（資料大、手機網路慢）。
+// 這段期間使用者存的東西（例如專有名詞草稿）若被舊快照直接覆蓋就會無聲消失，
+// 所以寫回時要再合併一次，而不是盲目覆寫。
+export async function applyMerged(doc, mergeFn) {
   const meetings = doc.meetings || [];
   const deleted = doc.deleted || [];
   const delSet = new Set(deleted);
@@ -126,7 +150,7 @@ export async function applyMerged(doc) {
     await run('readwrite', (os) => os.delete(id));
   }
   for (const m of meetings) {
-    if (!delSet.has(m.id)) await run('readwrite', (os) => os.put(m));
+    if (!delSet.has(m.id)) await putMergedOne(m, mergeFn);
   }
   setTombstones(deleted);
   if (doc.deletedAt) setTombstoneTimes(doc.deletedAt);

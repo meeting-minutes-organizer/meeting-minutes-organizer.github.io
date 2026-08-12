@@ -86,7 +86,7 @@ function mergeTerms(baseT, otherT) {
   return out;
 }
 
-function mergeMeeting(a, b) {
+export function mergeMeeting(a, b) {
   if (!a) return b;
   if (!b) return a;
   const base = editStamp(a) >= editStamp(b) ? a : b;
