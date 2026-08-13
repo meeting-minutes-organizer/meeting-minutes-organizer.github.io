@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v66';
+const APP_VERSION = 'v67';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1186,7 +1186,8 @@ async function renderDetail(id) {
   };
   const viewMeeting = () => {
     const c = contentFor(lang) || contentFor('orig');
-    return Object.assign({}, m, { transcript: c.transcript, summary: c.summary });
+    // notes 也要跟著語言走，否則切到英文匯出時會變成「英文逐字稿＋中文筆記」
+    return Object.assign({}, m, { transcript: c.transcript, summary: c.summary, notes: c.notes || null });
   };
 
   view.innerHTML = `
