@@ -296,3 +296,12 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 0
 .nt-quiz { padding: 10px; margin-bottom: 8px; background: var(--bg); border-radius: 10px; }
 .nt-q { font-weight: 700; }
 .nt-a { margin-top: 4px; color: var(--muted); line-height: 1.6; }
+
+/* 逐字稿時間標記（約每分鐘一個）與出處句高亮 */
+.time-mark {
+  margin: 12px 0 4px; font-size: 12px; font-weight: 700; color: var(--muted);
+  letter-spacing: 0.5px; display: flex; align-items: center; gap: 8px;
+}
+.time-mark::after { content: ''; flex: 1; height: 1px; background: var(--line); }
+mark.hit { background: #ffe58a; color: #1c1c1e; border-radius: 3px; padding: 0 2px; }
+@media (prefers-color-scheme: dark) { mark.hit { background: #7a5c00; color: #fff; } }

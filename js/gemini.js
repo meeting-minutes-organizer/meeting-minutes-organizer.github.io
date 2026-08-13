@@ -343,7 +343,8 @@ const SEG_SCHEMA = {
       type: 'array',
       items: {
         type: 'object',
-        properties: { speaker: { type: 'string' }, text: { type: 'string' } },
+        // t：這句開始的秒數（相對於這個音檔的開頭）。選填 —— 模型沒給也不能讓整段辨識失敗。
+        properties: { speaker: { type: 'string' }, text: { type: 'string' }, t: { type: 'number' } },
         required: ['speaker', 'text'],
       },
     },
@@ -354,7 +355,9 @@ const SEG_PROMPT =
   `你是專業會議記錄助理。請把這段會議錄音整理成「語者分段逐字稿」：\n` +
   `- 辨識不同說話者，標記「說話者1」「說話者2」…同一個人自始至終用同一標籤。\n` +
   `- 中文一律使用繁體中文（台灣用語），英文保留原文。\n` +
-  `- 每個 segment 格式 {"speaker":"說話者1","text":"…"}，適度斷句。`;
+  `- 每個 segment 格式 {"speaker":"說話者1","text":"…","t":秒數}，適度斷句。
+` +
+  `- t 是這句開始的「秒數」，相對於這個音檔開頭（整數即可）。抓不準就略過該句的 t，不要亂猜。`;
 
 function mmss(sec) {
   const s = Math.max(0, Math.round(sec));
@@ -393,7 +396,13 @@ async function transcribeWindow(uploads, mime, model, start, end, whole, onProgr
   let segments = null;
   if (text) {
     try {
-      segments = (JSON.parse(text).segments) || [];
+      segments = ((JSON.parse(text).segments) || []).map((s) => {
+        // 時間戳只在「是有限的非負數字」時才留；模型偶爾會回負數或字串，寧可沒有也不要錯的
+        const t = typeof s.t === 'number' && isFinite(s.t) && s.t >= 0 ? Math.round(s.t) : null;
+        const out = { speaker: s.speaker, text: s.text };
+        if (t != null) out.t = t;
+        return out;
+      });
     } catch (_) {
       segments = null;
     }

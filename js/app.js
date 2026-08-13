@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v65';
+const APP_VERSION = 'v66';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -45,6 +45,44 @@ function setHeader(text, showBack) {
   backBtn.onclick = () => (location.hash = '#/'); // 預設返回清單，個別頁面可覆寫
 }
 // 找出「這條摘要最可能出自哪一段逐字稿」：用字元二字組（bigram）重疊評分，免 API、即時
+// 秒數 → 顯示字串。單檔錄音用 h:mm:ss；多檔則標明是第幾支，方便回去找那個檔案。
+export function timeLabel(seg) {
+  const s = Math.max(0, Math.round((seg && seg.t) || 0));
+  const mm = Math.floor((s % 3600) / 60);
+  const ss = String(s % 60).padStart(2, '0');
+  if (seg && seg.fi != null) return `第 ${seg.fi + 1} 支 ${mm + Math.floor(s / 3600) * 60}:${ss}`;
+  const h = Math.floor(s / 3600);
+  return h ? `${h}:${String(mm).padStart(2, '0')}:${ss}` : `${mm}:${ss}`;
+}
+
+// 把字串轉換套用到學習筆記的每一個文字欄位（就地修改）。
+// 專有名詞訂正若只改逐字稿與摘要，筆記會留著錯字——那正是使用者複習時在看的東西。
+export function applyTermInNotes(notes, fix) {
+  if (!notes || typeof notes !== 'object') return notes;
+  const f = (v) => (typeof v === 'string' ? fix(v) : v);
+  (notes.outline || []).forEach((o) => {
+    o.title = f(o.title);
+    o.anchor = f(o.anchor);
+    o.points = (o.points || []).map(f);
+  });
+  (notes.concepts || []).forEach((c) => {
+    c.term = f(c.term);
+    c.plain = f(c.plain);
+    c.why = f(c.why);
+  });
+  (notes.tables || []).forEach((t) => {
+    t.title = f(t.title);
+    t.headers = (t.headers || []).map(f);
+    t.rows = (t.rows || []).map((r) => (Array.isArray(r) ? r.map(f) : r));
+  });
+  notes.figures = (notes.figures || []).map(f);
+  (notes.quiz || []).forEach((q) => {
+    q.q = f(q.q);
+    q.a = f(q.a);
+  });
+  return notes;
+}
+
 export function bestSegIndex(text, transcript) {
   const clean = (s) =>
     String(s == null ? '' : s)
@@ -72,6 +110,43 @@ export function bestSegIndex(text, transcript) {
     }
   });
   return bestScore >= 2 ? best : -1;
+}
+
+// 在找到的段落「裡面」再往下找一層：指出最相符的那一句。
+// 只捲到段落並整段閃爍時，段落一長就還是看不出出自哪裡。
+export function bestSentence(text, segText) {
+  const norm = (s) =>
+    String(s == null ? '' : s)
+      .replace(/\[DRI:[^\]]*\]/g, '')
+      .replace(/^問：|^答：|^Q:\s*|^A:\s*/g, '')
+      .toLowerCase();
+  const src = String(segText == null ? '' : segText);
+  // 中英文的句末標點都斷；保留標點在句尾，才能在原文中原樣找回來
+  const parts = src.split(/(?<=[。！？；!?;\n])/).map((s) => s.trim()).filter(Boolean);
+  if (parts.length <= 1) return src.trim();
+  const t = norm(text);
+  const grams = new Set();
+  for (let i = 0; i < t.length - 1; i++) {
+    const g = t.slice(i, i + 2);
+    if (/\S\S/.test(g)) grams.add(g);
+  }
+  if (!grams.size) return '';
+  let best = '';
+  let bestScore = 0;
+  for (const p of parts) {
+    const np = norm(p);
+    let score = 0;
+    grams.forEach((g) => {
+      if (np.includes(g)) score++;
+    });
+    // 長句天生比較容易命中 → 用長度稍微折抵，避免整段最長的那句總是贏
+    const adj = score / Math.sqrt(Math.max(4, np.length));
+    if (adj > bestScore) {
+      bestScore = adj;
+      best = p;
+    }
+  }
+  return bestScore >= 0.25 ? best : '';
 }
 
 // 逐字稿指紋：段數 + 各段語者/文字長度，用來偵測「翻譯期間原文是否被改動」
@@ -806,14 +881,29 @@ async function processJob(job) {
     // 3) 摘要（重點/待辦/Q&A 很重要 → 固定用品質模型，不受省額度影響）
     ui.setLabel('整理摘要中…');
     ui.easeTo(99, 20);
-    const allSegs = job.chunks.reduce((acc, c) => acc.concat(c.segments || []), []);
+    // 時間戳換算：模型回的 t 是「相對於該次上傳的那個音檔開頭」的秒數。
+    // - multi（使用者自己分好幾支）：記下是第幾支（fi），t 維持該支內的秒數
+    // - split／whole（同一個檔案切段或整檔時間窗）：加上該段的起始偏移 → 變成整場的絕對秒數
+    const allSegs = job.chunks.reduce((acc, c, ci) => {
+      const segs = (c.segments || []).map((sg) => {
+        if (sg.t == null) return sg;
+        return job.mode === 'multi' ? { ...sg, fi: ci } : { ...sg, t: sg.t + (c.start || 0) };
+      });
+      return acc.concat(segs);
+    }, []);
     const summaryModel = await pickModelForKeys(getApiKeyEntries(), { preferLite: false });
     const summary = await summarize(allSegs, getApiKeyEntries(), summaryModel, ui.onProgress);
     ui.stopEase();
     ui.setBar(100);
     ui.setLabel('完成！');
     // 4) 存成會議、清除任務
-    const meeting = { id: uid(), title: job.title, createdAt: job.createdAt, updatedAt: Date.now(), transcript: allSegs, summary };
+    const meeting = {
+      id: uid(), title: job.title, createdAt: job.createdAt, updatedAt: Date.now(),
+      transcript: allSegs, summary,
+      durationSec: job.durationSec || 0,
+      audioMode: job.mode || 'whole',
+      audioParts: (job.chunks || []).map((c) => ({ start: c.start || 0, end: c.end || 0, name: c.name || '' })),
+    };
     await save(meeting);
     await clearJob(job.id);
     jobRunning = false;
@@ -1245,8 +1335,25 @@ async function renderDetail(id) {
     const qa = s.qa || [];
     const colors = speakerColors(c.transcript);
     const isOrig = l === 'orig';
+    // 時間標記：約每分鐘插一個，畫面才不會被時間塞滿。多檔錄音各自從 0 分開始計。
+    let lastMark = null;
     const segHtml = (c.transcript || [])
-      .map((seg, i) => `<div class="seg" data-seg="${i}"${isOrig ? ` data-i="${i}"` : ''}><span class="spk" style="color:${colors[seg.speaker] || 'var(--ink)'}">${esc(seg.speaker)}</span>${esc(seg.text)}</div>`)
+      .map((seg, i) => {
+        let mark = '';
+        if (seg.t != null) {
+          const key = `${seg.fi == null ? '' : seg.fi}:${Math.floor(seg.t / 60)}`;
+          if (key !== lastMark) {
+            lastMark = key;
+            mark = `<div class="time-mark">${esc(timeLabel(seg))}</div>`;
+          }
+        }
+        return (
+          mark +
+          `<div class="seg" data-seg="${i}"${isOrig ? ` data-i="${i}"` : ''}>` +
+          `<span class="spk" style="color:${colors[seg.speaker] || 'var(--ink)'}">${esc(seg.speaker)}</span>` +
+          `<span class="seg-t">${esc(seg.text)}</span></div>`
+        );
+      })
       .join('');
     const speakers = Object.keys(colors);
     const chipsHtml =
@@ -1308,10 +1415,26 @@ async function renderDetail(id) {
     });
 
     // 點摘要條目 → 跳到逐字稿出處（本機文字比對，不耗額度）
-    const jumpTo = (idx) => {
+    // srcText：這一條摘要/筆記的原文，用來在段落裡再標出最相符的那一句
+    const jumpTo = (idx, srcText) => {
       setCollapsed('tr', false);
       const target = bodyEl.querySelector(`.seg[data-seg="${idx}"]`);
       if (!target) return;
+      // 先清掉上一次的螢光
+      bodyEl.querySelectorAll('mark.hit').forEach((el) => el.replaceWith(...el.childNodes));
+      const seg = (c.transcript || [])[idx];
+      const hit = srcText && seg ? bestSentence(srcText, seg.text || '') : '';
+      if (hit) {
+        const txtNode = target.querySelector('.seg-t');
+        if (txtNode) {
+          const raw = seg.text || '';
+          const at = raw.indexOf(hit);
+          if (at >= 0) {
+            txtNode.innerHTML =
+              esc(raw.slice(0, at)) + '<mark class="hit">' + esc(hit) + '</mark>' + esc(raw.slice(at + hit.length));
+          }
+        }
+      }
       if (target.scrollIntoView) target.scrollIntoView({ behavior: 'smooth', block: 'center' });
       target.classList.add('flash');
       setTimeout(() => target.classList.remove('flash'), 2400);
@@ -1328,7 +1451,9 @@ async function renderDetail(id) {
           toast('找不到明確的逐字稿出處');
           return;
         }
-        jumpTo(idx);
+        jumpTo(idx, itemText);
+        const seg = (c.transcript || [])[idx];
+        if (seg && seg.t != null) toast(`出處約在 ${timeLabel(seg)}`);
       };
     });
 
@@ -1517,6 +1642,8 @@ async function renderDetail(id) {
     ['actionItems', 'mainPoints', 'keyPoints', 'qa'].forEach((k) => {
       if (Array.isArray(s[k])) s[k] = s[k].map((x) => protectedReplace(x, oldV, newV));
     });
+    // 學習筆記也要一起訂正，否則逐字稿改對了、複習時看的筆記還是錯字
+    if (fresh.notes) applyTermInNotes(fresh.notes, (x) => protectedReplace(x, oldV, newV));
     fresh.translations = {}; // 內容改了 → 清掉舊翻譯
   };
 
@@ -1538,7 +1665,7 @@ async function renderDetail(id) {
   const drawTerms = () => {
     const data = m.terms;
     if (!data || !data.items) {
-      termsBody.innerHTML = `<div class="hint" style="margin-top:0">自動挑出逐字稿裡的人名、公司、產品、地名等專有名詞，把辨識聽錯／拼錯的字改對（會同時更新逐字稿與摘要）。<br>可以先<b>逐一改好、最後按一次「套用全部訂正」</b>統一生效。</div>
+      termsBody.innerHTML = `<div class="hint" style="margin-top:0">自動挑出逐字稿裡的人名、公司、產品、地名等專有名詞，把辨識聽錯／拼錯的字改對（會同時更新逐字稿、會議摘要與學習筆記）。<br>可以先<b>逐一改好、最後按一次「套用全部訂正」</b>統一生效。</div>
         <button class="big" id="scanTerms" data-task="terms">🔍 自動挑出專有名詞</button>`;
       const sb = document.getElementById('scanTerms');
       if (sb) sb.onclick = () => doScanTerms(sb);
@@ -1565,7 +1692,7 @@ async function renderDetail(id) {
         <button class="act-btn" id="addTerm">＋ 手動新增</button>
       </div>
       ${items.length ? `<div class="term-list">${rows}</div>` : '<div class="hint">這份逐字稿沒有挑到明顯的專有名詞。你可以用「手動新增」自己補。</div>'}
-      ${pendingCount ? `<button class="big" id="applyTerms" style="margin-top:12px">✅ 套用全部訂正（${pendingCount}）</button><div class="hint" style="margin-top:6px">按下後才會一次改動逐字稿與摘要，並同步雲端。</div>` : ''}`;
+      ${pendingCount ? `<button class="big" id="applyTerms" style="margin-top:12px">✅ 套用全部訂正（${pendingCount}）</button><div class="hint" style="margin-top:6px">按下後才會一次改動逐字稿、會議摘要與學習筆記，並同步雲端。</div>` : ''}`;
     document.getElementById('rescanTerms').onclick = (e) => doScanTerms(e.target);
     document.getElementById('addTerm').onclick = () => openTermEditor(-1);
     termsBody.querySelectorAll('.term-row').forEach((r) => {
