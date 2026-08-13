@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v67';
+const APP_VERSION = 'v68';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1812,6 +1812,7 @@ async function renderDetail(id) {
     }
     if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區的內容（其他區不變）。`)) return;
     try {
+      const before = ((m.summary || {})[section] || []).length;
       const items = await runDetailTask(id, 'enh:' + section, `加強${nameMap[section]}中…`, (setMsg) =>
         enhanceSection(m.transcript, section, getApiKeyEntries(), {
           onProgress: (info) => setMsg(info && info.message),
@@ -1824,7 +1825,7 @@ async function renderDetail(id) {
       }, { edit: true });
       renderDetail(id);
       const skipped = items.dropped || 0;
-      toast(`已加強${nameMap[section]}（共 ${items.length} 筆${skipped ? `，另略過 ${skipped} 則議程性問答` : ''}）`);
+      toast(`已加強${nameMap[section]}：${before} 筆 → ${items.length} 筆${skipped ? `（另略過 ${skipped} 則議程性問答）` : ''}`);
     } catch (e) {
       alert('加強失敗：' + (e && e.message ? e.message : e));
     }
@@ -1990,6 +1991,7 @@ async function renderDetail(id) {
     }
     if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區（其他區不變）。`)) return;
     try {
+      const before = ((m.notes || {})[section] || []).length;
       const items = await runDetailTask(id, 'nenh:' + section, `加強${nameMap[section]}中…`, (setMsg) =>
         enhanceNotesSection(m.transcript, section, getApiKeyEntries(), { onProgress: (info) => setMsg(info && info.message) })
       );
@@ -1999,7 +2001,8 @@ async function renderDetail(id) {
         fresh.translations = {}; // 內容改了 → 清掉舊翻譯
       }, { edit: true });
       renderDetail(id);
-      toast(`已加強${nameMap[section]}（共 ${items.length} 筆）`);
+      // 標出加強前後的筆數：沒有變化時使用者才知道是「本來就抓完了」而不是按鈕沒作用
+      toast(`已加強${nameMap[section]}：${before} 筆 → ${items.length} 筆`);
     } catch (e) {
       alert('加強失敗：' + (e && e.message ? e.message : e));
     }
