@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v62';
+const APP_VERSION = 'v63';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1455,6 +1455,9 @@ async function renderDetail(id) {
   const openTermEditor = (idx) => {
     const items = (m.terms && m.terms.items) || [];
     const it = idx >= 0 ? items[idx] : null;
+    // 用「詞本身」當識別，不用陣列位置：同步合併會重建 terms.items，順序可能與畫面不同，
+    // 若照索引去改就會改到別筆（甚至因為新值剛好等於那筆的現況而被當成取消，草稿就沒了）。
+    const key = it ? it.t : null;
     const curOld = it ? termCurrent(it) : '';
     const prefill = it ? (it.draft || it.fix || termCurrent(it)) : '';
     const row = idx >= 0 ? termsBody.querySelector(`.term-row[data-i="${idx}"]`) : null;
@@ -1481,9 +1484,10 @@ async function renderDetail(id) {
       await persist((fresh) => {
         fresh.terms = fresh.terms || { items: [] };
         fresh.terms.items = fresh.terms.items || [];
-        if (idx >= 0 && fresh.terms.items[idx]) {
-          if (!newV || newV === termCurrent(fresh.terms.items[idx])) delete fresh.terms.items[idx].draft;
-          else fresh.terms.items[idx].draft = newV;
+        const target = key ? fresh.terms.items.find((x) => x && x.t === key) : null;
+        if (target) {
+          if (!newV || newV === termCurrent(target)) delete target.draft;
+          else target.draft = newV;
         } else if (newV && newV !== oldV) {
           fresh.terms.items.push({ t: oldV, cat: 'term', fix: '', draft: newV });
         }

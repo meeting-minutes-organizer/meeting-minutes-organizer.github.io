@@ -60,16 +60,17 @@ function mergeTerms(baseT, otherT) {
   const oItems = (otherT && otherT.items) || [];
   if (!baseT && !otherT) return null;
   const map = new Map();
-  for (const it of [...oItems, ...bItems]) {
-    // base 後放 → 同一個詞以 base 為準，但草稿與已套用結果採「誰有就留誰」
+  // 先放 base：順序以它為準（＝畫面上看到的順序，重排會讓使用者對不上）
+  for (const it of bItems) if (it && it.t) map.set(it.t, { ...it });
+  // 再用 other 補：base 沒有的詞附在後面；同一個詞以 base 為準，但草稿與已套用結果「誰有就留誰」
+  for (const it of oItems) {
     if (!it || !it.t) continue;
     const prev = map.get(it.t);
-    map.set(
-      it.t,
-      prev
-        ? { ...prev, ...it, draft: it.draft || prev.draft, applied: it.applied || prev.applied }
-        : { ...it }
-    );
+    if (!prev) {
+      map.set(it.t, { ...it });
+      continue;
+    }
+    map.set(it.t, { ...it, ...prev, draft: prev.draft || it.draft, applied: prev.applied || it.applied });
   }
   const items = Array.from(map.values()).map((it) => {
     // 草稿與已套用結果相同 → 這筆已經生效，不必再留草稿
