@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, requestAbort, clearAbort, isAborted, missingKeyEntries } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, requestAbort, clearAbort, isAborted, missingKeyEntries } from './gemini.js';
 import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v63';
+const APP_VERSION = 'v64';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1112,7 +1112,11 @@ async function renderDetail(id) {
         <button class="act-btn" id="pdfBtn">📄 PDF</button>
         <button class="act-btn" id="wordBtn">📝 Word</button>
       </div>
-      <div class="act-grid">
+      <div class="lang-toggle" id="modeToggle" style="margin-top:10px">
+        <button data-mode="meeting">📋 會議摘要</button>
+        <button data-mode="notes">📚 學習筆記</button>
+      </div>
+      <div class="act-grid" id="enhGrid">
         <button class="act-btn" data-enh="actionItems" data-task="enh:actionItems">✅ 加強待辦</button>
         <button class="act-btn" data-enh="mainPoints" data-task="enh:mainPoints">📌 加強重點</button>
         <button class="act-btn" data-enh="qa" data-task="enh:qa">❓ 加強Q&A</button>
@@ -1133,6 +1137,83 @@ async function renderDetail(id) {
     <button class="big danger" id="del" style="margin-top:16px">刪除這場會議</button>`;
 
   const bodyEl = document.getElementById('detailBody');
+
+  // ===== 摘要模式：會議摘要（原有三區）／學習筆記（研討會、上課用的五區）=====
+  // 每場會議各自記住上次看的模式：研討會下次進來就直接是學習筆記。
+  const MODE_KEY = 'detail_mode';
+  const getModeMap = () => {
+    try {
+      return JSON.parse(localStorage.getItem(MODE_KEY)) || {};
+    } catch (_) {
+      return {};
+    }
+  };
+  let mode = getModeMap()[id] === 'notes' ? 'notes' : 'meeting';
+  const setMode = (v) => {
+    mode = v === 'notes' ? 'notes' : 'meeting';
+    const mm = getModeMap();
+    mm[id] = mode;
+    localStorage.setItem(MODE_KEY, JSON.stringify(mm));
+    document.querySelectorAll('#modeToggle button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
+    const eg = document.getElementById('enhGrid');
+    if (eg) eg.hidden = mode === 'notes'; // 學習筆記的分區加強在第二批才做
+    drawBody(lang);
+  };
+
+  const tableHtml = (t) => {
+    const head = t.headers.map((h) => `<th>${esc(h)}</th>`).join('');
+    const body = t.rows
+      .map((r) => `<tr>${t.headers.map((_, i) => `<td>${esc(r[i] || '')}</td>`).join('')}</tr>`)
+      .join('');
+    return `<div class="nt-table">${t.title ? `<div class="nt-table-title">${esc(t.title)}</div>` : ''}
+      <div class="nt-table-scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div></div>`;
+  };
+
+  // 學習筆記卡片。沒產生過就顯示產生按鈕（按需產生，不自動燒額度）
+  const notesCardHtml = (c, secHead, coll) => {
+    const n = c.notes || m.notes;
+    if (!n) {
+      return `<div class="card mode-pane">
+        <div class="hint" style="margin-top:0">學習筆記把研討會／課程的內容重整成<b>複習用</b>的形式：章節大綱、重要概念、對照表、關鍵數據、自我測驗。</div>
+        <div class="warn" style="margin-top:8px">建議<b>先做完專有名詞訂正並套用</b>再產生——筆記的品質完全取決於逐字稿。</div>
+        <button class="big" id="genNotes" data-task="notes">📚 產生學習筆記</button>
+      </div>`;
+    }
+    const outline = (n.outline || [])
+      .map(
+        (o, i) =>
+          `<div class="nt-sec" data-jump="nt:${i}"><div class="nt-sec-t">${i + 1}. ${esc(o.title)}</div>` +
+          `${(o.points || []).length ? `<ul class="list">${o.points.map((p) => `<li>${esc(p)}</li>`).join('')}</ul>` : ''}</div>`
+      )
+      .join('');
+    const concepts = (n.concepts || [])
+      .map(
+        (x) =>
+          `<div class="nt-concept"><div class="nt-term">${esc(x.term)}</div><div class="nt-plain">${esc(x.plain)}</div>` +
+          `${x.why ? `<div class="nt-why">→ ${esc(x.why)}</div>` : ''}</div>`
+      )
+      .join('');
+    const tables = (n.tables || []).map(tableHtml).join('');
+    const figures = (n.figures || []).length ? `<ul class="list">${n.figures.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : '';
+    const quiz = (n.quiz || [])
+      .map((x, i) => `<div class="nt-quiz"><div class="nt-q">Q${i + 1}. ${esc(x.q)}</div><div class="nt-a">${esc(x.a)}</div></div>`)
+      .join('');
+    const none = '<div class="meta" style="padding-left:4px">（無）</div>';
+    return `<div class="card mode-pane">
+      ${secHead('nt-o', '📑 章節大綱 Outline', 'nt-o', 'margin-top:0')}
+      <div class="sec-body" data-secbody="nt-o"${coll['nt-o'] ? ' hidden' : ''}>${outline || none}</div>
+      ${secHead('nt-c', '💡 重要概念 Concepts', 'nt-c')}
+      <div class="sec-body" data-secbody="nt-c"${coll['nt-c'] ? ' hidden' : ''}>${concepts || none}</div>
+      ${secHead('nt-t', '📊 對照表 Tables', 'nt-t')}
+      <div class="sec-body" data-secbody="nt-t"${coll['nt-t'] ? ' hidden' : ''}>${tables || none}</div>
+      ${secHead('nt-f', '🔢 關鍵數據 Key Figures', 'nt-f')}
+      <div class="sec-body" data-secbody="nt-f"${coll['nt-f'] ? ' hidden' : ''}>${figures || none}</div>
+      ${secHead('nt-q', '✍️ 自我測驗 Quiz', 'nt-q')}
+      <div class="sec-body" data-secbody="nt-q"${coll['nt-q'] ? ' hidden' : ''}>${quiz || none}</div>
+      <div class="hint" style="margin-top:10px">點章節可跳到它在逐字稿中的出處；標題可摺疊／展開。
+        <button class="copy" id="regenNotes" style="margin-left:6px">重新產生</button></div>
+    </div>`;
+  };
 
   const drawBody = (l) => {
     const c = contentFor(l);
@@ -1178,8 +1259,9 @@ async function renderDetail(id) {
     const secHead = (k, title, copyKey, extra) =>
       `<div class="section-title sec-head" data-sec="${k}"${extra ? ` style="${extra}"` : ''}><span class="sec-t">${title}</span><span class="sec-right"><button class="copy" data-copy="${copyKey}">複製</button><span class="chev">${coll[k] ? '▸' : '▾'}</span></span></div>`;
 
-    bodyEl.innerHTML = `
-      <div class="card">
+    // 會議摘要三區 vs 學習筆記五區：只有這張卡片隨模式切換，逐字稿以下兩模式共用
+    const meetingCard = `
+      <div class="card mode-pane">
         ${secHead('ai', '✅ 待辦事項 Action Item', 'ai', 'margin-top:0')}
         <div class="sec-body" data-secbody="ai"${coll.ai ? ' hidden' : ''}>${olHtml(actionItems, 'ai')}</div>
         ${secHead('mp', '📌 會議重點 Main Point', 'mp')}
@@ -1187,7 +1269,10 @@ async function renderDetail(id) {
         ${secHead('qa', '❓ 會議提問 Q&amp;A', 'qa')}
         <div class="sec-body" data-secbody="qa"${coll.qa ? ' hidden' : ''}>${qaHtml(qa)}</div>
         <div class="hint" style="margin-top:10px">點各區標題可摺疊／展開；<b>點任一條內容</b>可跳到它在逐字稿中的出處</div>
-      </div>
+      </div>`;
+
+    bodyEl.innerHTML = `
+      ${mode === 'notes' ? notesCardHtml(c, secHead, coll) : meetingCard}
       ${secHead('tr', '🗣️ 逐字稿', 'tr')}
       <div class="sec-body" data-secbody="tr"${coll.tr ? ' hidden' : ''}>
         ${isOrig ? `<div class="hint" style="margin:0 4px 6px">點語者可改名；<b>點段落文字可直接修改錯字</b></div>` : ''}
@@ -1213,7 +1298,9 @@ async function renderDetail(id) {
       target.classList.add('flash');
       setTimeout(() => target.classList.remove('flash'), 2400);
     };
-    const arrMap = { ai: actionItems, mp: mainPoints, qa };
+    // 學習筆記的章節用「原話錨點」定位（逐字稿沒有時間戳），錨點不可靠時退回用標題比對
+    const noteAnchors = ((c.notes || m.notes || {}).outline || []).map((o) => o.anchor || o.title);
+    const arrMap = { ai: actionItems, mp: mainPoints, qa, 'nt': noteAnchors };
     bodyEl.querySelectorAll('[data-jump]').forEach((li) => {
       li.onclick = () => {
         const [k, iStr] = li.dataset.jump.split(':');
@@ -1227,7 +1314,20 @@ async function renderDetail(id) {
       };
     });
 
-    const texts = { ai: numbered(actionItems), mp: numbered(mainPoints), qa: qaText(qa), tr: transcriptToText(c.transcript) };
+    const nt = c.notes || m.notes || {};
+    const texts = {
+      ai: numbered(actionItems),
+      mp: numbered(mainPoints),
+      qa: qaText(qa),
+      tr: transcriptToText(c.transcript),
+      'nt-o': (nt.outline || []).map((o, i) => `${i + 1}. ${o.title}\n${(o.points || []).map((p) => `   - ${p}`).join('\n')}`).join('\n'),
+      'nt-c': (nt.concepts || []).map((x) => `${x.term}：${x.plain}${x.why ? `（${x.why}）` : ''}`).join('\n'),
+      'nt-t': (nt.tables || [])
+        .map((t) => [t.title, t.headers.join('\t'), ...t.rows.map((r) => r.join('\t'))].filter(Boolean).join('\n'))
+        .join('\n\n'),
+      'nt-f': numbered(nt.figures || []),
+      'nt-q': (nt.quiz || []).map((x, i) => `Q${i + 1}. ${x.q}\nA. ${x.a}`).join('\n\n'),
+    };
     bodyEl.querySelectorAll('.copy').forEach((b) => {
       b.onclick = async () => {
         try {
@@ -1240,6 +1340,11 @@ async function renderDetail(id) {
         }
       };
     });
+
+    const gn = document.getElementById('genNotes');
+    if (gn) gn.onclick = () => doGenNotes();
+    const rgn = document.getElementById('regenNotes');
+    if (rgn) rgn.onclick = () => doGenNotes();
 
     if (isOrig) {
       // 點段落 → 直接編輯逐字稿文字
@@ -1688,7 +1793,57 @@ async function renderDetail(id) {
     }
   };
 
-  drawBody('orig');
+  // 產生學習筆記（按需，不自動跑）
+  const doGenNotes = async () => {
+    if (!hasApiKey()) {
+      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
+      return;
+    }
+    if (!(m.transcript && m.transcript.length)) {
+      alert('這場沒有逐字稿，無法產生學習筆記');
+      return;
+    }
+    if (detailBusy()) {
+      toast('已有一項作業進行中，請等它完成');
+      return;
+    }
+    if (m.notes && !confirm('重新產生學習筆記？會取代目前這份。')) return;
+    try {
+      const notes = await runDetailTask(id, 'notes', '整理學習筆記中…', (setMsg) =>
+        generateNotes(m.transcript, getApiKeyEntries(), { onProgress: (info) => setMsg(info && info.message) })
+      );
+      await persist((fresh) => {
+        fresh.notes = { ...notes, generatedAt: Date.now() };
+      });
+      renderDetail(id);
+      toast(`學習筆記完成（${notes.outline.length} 節、${notes.concepts.length} 個概念、${notes.tables.length} 張表）`);
+    } catch (e) {
+      alert('產生學習筆記失敗：' + (e && e.message ? e.message : e));
+    }
+  };
+
+  // 模式切換：分頁鈕 ＋ 內容區內左右滑動（不含左右邊緣，避免與 iOS 返回手勢打架）
+  document.querySelectorAll('#modeToggle button').forEach((b) => {
+    b.onclick = () => setMode(b.dataset.mode);
+  });
+  let sx = 0;
+  let sy = 0;
+  bodyEl.addEventListener('touchstart', (e) => {
+    const t = e.touches && e.touches[0];
+    if (!t) return;
+    sx = t.clientX;
+    sy = t.clientY;
+  }, { passive: true });
+  bodyEl.addEventListener('touchend', (e) => {
+    const t = e.changedTouches && e.changedTouches[0];
+    if (!t || sx < 40 || sx > window.innerWidth - 40) return; // 從邊緣起手 → 交給系統返回手勢
+    const dx = t.clientX - sx;
+    const dy = t.clientY - sy;
+    if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5) return; // 要夠橫、夠長才算滑動
+    setMode(dx < 0 ? 'notes' : 'meeting');
+  }, { passive: true });
+
+  setMode(mode); // 套用記住的模式（同時會畫出內容）
   // 重繪後把仍在跑的作業狀態畫回按鈕（離開再回來時才看得出它還在跑）
   paintDetailTasks();
 }

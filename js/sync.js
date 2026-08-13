@@ -97,6 +97,10 @@ export function mergeMeeting(a, b) {
   if (chat.length) merged.chat = chat;
   const terms = mergeTerms(base.terms, other.terms);
   if (terms) merged.terms = terms;
+  // 學習筆記：整份取 editStamp 較新的那一份（內容彼此關聯，混合會半新半舊）；
+  // 但只有一邊有的時候一定要留住，否則剛產生好的筆記會被沒有筆記的另一邊蓋掉。
+  const notes = base.notes || other.notes;
+  if (notes) merged.notes = notes;
   if (editStamp(a) === editStamp(b)) {
     // 同一逐字稿版本 → 兩邊翻譯互補（base 優先）
     merged.translations = { ...(other.translations || {}), ...(base.translations || {}) };

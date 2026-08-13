@@ -897,6 +897,130 @@ export async function extractTerms(segments, apiKeys, opts = {}) {
   return Array.from(map.values());
 }
 
+// ---- 學習筆記（研討會／上課用）----
+// 會議摘要的框架是「決定了什麼」（待辦/重點/Q&A），對一頁頁過投影片的課程完全不適用：
+// 表格會被壓成散文、概念沒有解釋、數字散落在句子裡。這裡改用「複習」的框架重整。
+// 逐字稿沒有時間戳，所以章節用「原話錨點」定位，交給既有的文字比對跳到出處。
+const NOTES_SCHEMA = {
+  type: 'object',
+  properties: {
+    outline: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { title: { type: 'string' }, anchor: { type: 'string' }, points: { type: 'array', items: { type: 'string' } } },
+        required: ['title', 'points'],
+      },
+    },
+    concepts: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { term: { type: 'string' }, plain: { type: 'string' }, why: { type: 'string' } },
+        required: ['term', 'plain'],
+      },
+    },
+    tables: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: {
+          title: { type: 'string' },
+          headers: { type: 'array', items: { type: 'string' } },
+          rows: { type: 'array', items: { type: 'array', items: { type: 'string' } } },
+        },
+        required: ['title', 'headers', 'rows'],
+      },
+    },
+    figures: { type: 'array', items: { type: 'string' } },
+    quiz: {
+      type: 'array',
+      items: { type: 'object', properties: { q: { type: 'string' }, a: { type: 'string' } }, required: ['q', 'a'] },
+    },
+  },
+  required: ['outline', 'concepts', 'tables', 'figures', 'quiz'],
+};
+
+const NOTES_PROMPT =
+  `以下是一場研討會／課程的逐字稿。請整理成「複習用的學習筆記」，` +
+  `使用與逐字稿相同的主要語言（中文用繁體中文、台灣用語）。\n` +
+  `- outline（章節大綱）：依講述順序分節。title 為 8～20 字的主題；points 列出該節重點；` +
+  `anchor 填該節開始處逐字稿中的「一句原話」（10～20 字，必須是逐字稿裡真的出現過的字串，供跳轉定位，不可自行改寫）。\n` +
+  `- concepts（重要概念）：挑出需要理解的名詞或機制。term＝名詞本身；plain＝用白話說明它是什麼；why＝為什麼重要／用在哪裡。\n` +
+  `- tables（對照表）：把「多項目 × 多屬性」的內容還原成表格（技術優缺點比較、規格對照、各家差異等）。` +
+  `headers 是欄位名，rows 每一列的長度必須與 headers 相同。沒有適合的內容就回空陣列，不要硬湊。\n` +
+  `- figures（關鍵數據）：具體數字連同單位與脈絡，例如「解熱能力 1600W（全鋁方案實測）」。\n` +
+  `- quiz（自我測驗）：依內容出題幫助主動回想。a 必須是逐字稿裡找得到依據的答案；沒有答案的題目不要出。\n` +
+  `務求忠於逐字稿，不可自行補充逐字稿沒有講到的知識。\n\n逐字稿：\n`;
+
+const asStr = (x) => (typeof x === 'string' ? x.trim() : '');
+const asArr = (x) => (Array.isArray(x) ? x : []);
+
+// 把模型回傳正規化成穩定結構（欄位缺漏、表格列被回成字串等都要容忍）
+export function normalizeNotes(r) {
+  const o = r || {};
+  return {
+    outline: asArr(o.outline)
+      .map((x) => ({ title: asStr(x && x.title), anchor: asStr(x && x.anchor), points: asArr(x && x.points).map(asStr).filter(Boolean) }))
+      .filter((x) => x.title),
+    concepts: asArr(o.concepts)
+      .map((x) => ({ term: asStr(x && x.term), plain: asStr(x && x.plain), why: asStr(x && x.why) }))
+      .filter((x) => x.term),
+    tables: asArr(o.tables)
+      .map((t) => {
+        const headers = asArr(t && t.headers).map(asStr).filter(Boolean);
+        const rows = asArr(t && t.rows)
+          // 有時模型會把整列回成 "a | b | c" 字串而不是陣列
+          .map((row) => (Array.isArray(row) ? row.map(asStr) : asStr(row).split('|').map((s) => s.trim())))
+          .filter((row) => row.some(Boolean));
+        return { title: asStr(t && t.title), headers, rows };
+      })
+      .filter((t) => t.headers.length && t.rows.length), // 沒有資料列的表格不留空殼
+    figures: asArr(o.figures).map(asStr).filter(Boolean),
+    quiz: asArr(o.quiz)
+      .map((x) => ({ q: asStr(x && x.q), a: asStr(x && x.a) }))
+      .filter((x) => x.q),
+  };
+}
+
+// 產生學習筆記（整份逐字稿一次生成，快且省；不夠完整時再用分區加強補）
+export async function generateNotes(segments, apiKeys, opts = {}) {
+  const onProgress = opts.onProgress;
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+  const model = await resolveModel(kos.map((k) => k.key), { preferLite: false }); // 學習筆記固定用品質模型
+  const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
+  const res = await postJsonRotating(
+    kos.map((k) => ({ key: k.key, name: k.name })),
+    (v) => ({
+      url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+      body: JSON.stringify({
+        contents: [{ parts: [{ text: NOTES_PROMPT + text }] }],
+        generationConfig: {
+          responseMimeType: 'application/json',
+          responseSchema: NOTES_SCHEMA,
+          maxOutputTokens: 65535,
+          thinkingConfig: { thinkingBudget: 0 },
+        },
+      }),
+    }),
+    onProgress,
+    '整理學習筆記中…'
+  );
+  const data = await res.json();
+  const out =
+    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
+    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  if (!out) throw new Error('未取得學習筆記，請重試。');
+  let r;
+  try {
+    r = JSON.parse(out);
+  } catch (_) {
+    throw new Error('學習筆記解析失敗，請重試。');
+  }
+  return normalizeNotes(r);
+}
+
 // ---- 翻譯（純文字，很省）：固定用品質模型；逐字稿分批翻避免超過輸出上限 ----
 const LANG_LABEL = { zh: '繁體中文 (Traditional Chinese)', en: 'English', ja: '日本語 (Japanese)' };
 const SUMMARY_TR_SCHEMA = {
