@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, requestAbort, clearAbort, isAborted, missingKeyEntries } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries } from './gemini.js';
 import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v64';
+const APP_VERSION = 'v65';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -170,14 +170,15 @@ const EXPORT_SECTIONS = [
   { k: 'actionItems', label: '✅ 待辦事項 Action Item' },
   { k: 'mainPoints', label: '📌 會議重點 Main Point' },
   { k: 'qa', label: '❓ 會議提問 Q&A' },
+  { k: 'notes', label: '📚 學習筆記（含表格）' },
   { k: 'transcript', label: '🗣️ 逐字稿 Transcribe' },
 ];
 function getExportSections() {
   try {
     const o = JSON.parse(localStorage.getItem(EXPORT_SEC_KEY)) || {};
-    return EXPORT_SECTIONS.reduce((a, s) => ((a[s.k] = o[s.k] !== false), a), {});
+    return EXPORT_SECTIONS.reduce((a, s) => ((a[s.k] = s.k === 'notes' ? o.notes === true : o[s.k] !== false), a), {});
   } catch (_) {
-    return EXPORT_SECTIONS.reduce((a, s) => ((a[s.k] = true), a), {});
+    return EXPORT_SECTIONS.reduce((a, s) => ((a[s.k] = s.k !== 'notes'), a), {});
   }
 }
 // 匯出前選段落；回傳選項物件，取消則回傳 null
@@ -1088,9 +1089,10 @@ async function renderDetail(id) {
       : '無';
 
   const contentFor = (l) => {
-    if (l === 'orig') return { transcript: m.transcript || [], summary: m.summary || {} };
+    if (l === 'orig') return { transcript: m.transcript || [], summary: m.summary || {}, notes: m.notes || null };
     const t = m.translations && m.translations[l];
-    return t ? { transcript: t.transcript || [], summary: t.summary || {} } : null;
+    // 譯本沒有筆記（例如翻譯當時還沒產生）→ 退回原文筆記，總比整區空白好
+    return t ? { transcript: t.transcript || [], summary: t.summary || {}, notes: t.notes || m.notes || null } : null;
   };
   const viewMeeting = () => {
     const c = contentFor(lang) || contentFor('orig');
@@ -1116,11 +1118,7 @@ async function renderDetail(id) {
         <button data-mode="meeting">📋 會議摘要</button>
         <button data-mode="notes">📚 學習筆記</button>
       </div>
-      <div class="act-grid" id="enhGrid">
-        <button class="act-btn" data-enh="actionItems" data-task="enh:actionItems">✅ 加強待辦</button>
-        <button class="act-btn" data-enh="mainPoints" data-task="enh:mainPoints">📌 加強重點</button>
-        <button class="act-btn" data-enh="qa" data-task="enh:qa">❓ 加強Q&A</button>
-      </div>
+      <div class="act-grid" id="enhGrid"></div>
     </div>
     <div id="detailBody"></div>
     <div class="card" id="termsCard">
@@ -1156,9 +1154,29 @@ async function renderDetail(id) {
     localStorage.setItem(MODE_KEY, JSON.stringify(mm));
     document.querySelectorAll('#modeToggle button').forEach((b) => b.classList.toggle('active', b.dataset.mode === mode));
     const eg = document.getElementById('enhGrid');
-    if (eg) eg.hidden = mode === 'notes'; // 學習筆記的分區加強在第二批才做
+    if (eg) {
+      eg.innerHTML =
+        mode === 'notes'
+          ? NOTE_ENH.map((x) => `<button class="act-btn" data-nenh="${x.k}" data-task="nenh:${x.k}">${x.label}</button>`).join('')
+          : MEET_ENH.map((x) => `<button class="act-btn" data-enh="${x.k}" data-task="enh:${x.k}">${x.label}</button>`).join('');
+      eg.hidden = mode === 'notes' && !m.notes; // 還沒產生筆記時沒有東西可加強
+      wireEnhButtons();
+    }
     drawBody(lang);
   };
+
+  const MEET_ENH = [
+    { k: 'actionItems', label: '✅ 加強待辦' },
+    { k: 'mainPoints', label: '📌 加強重點' },
+    { k: 'qa', label: '❓ 加強Q&A' },
+  ];
+  const NOTE_ENH = [
+    { k: 'outline', label: '📑 加強大綱' },
+    { k: 'concepts', label: '💡 加強概念' },
+    { k: 'tables', label: '📊 加強表格' },
+    { k: 'figures', label: '🔢 加強數據' },
+    { k: 'quiz', label: '✍️ 加強測驗' },
+  ];
 
   const tableHtml = (t) => {
     const head = t.headers.map((h) => `<th>${esc(h)}</th>`).join('');
@@ -1417,6 +1435,7 @@ async function renderDetail(id) {
         const fp = transcriptFingerprint(m.transcript); // 翻譯前記錄逐字稿指紋
         const tr = await runDetailTask(id, 'tr:' + l, '翻譯中…', (setMsg) =>
           translateMeeting(m.transcript, m.summary, l, getApiKeyEntries(), {
+            notes: m.notes || null,
             onProgress: (info) => {
               setMsg(info && info.message);
               const el = document.getElementById('tprogmsg');
@@ -1682,7 +1701,11 @@ async function renderDetail(id) {
       alert('加強失敗：' + (e && e.message ? e.message : e));
     }
   };
-  document.querySelectorAll('[data-enh]').forEach((b) => (b.onclick = () => doEnhance(b.dataset.enh, b)));
+  function wireEnhButtons() {
+    document.querySelectorAll('[data-enh]').forEach((b) => (b.onclick = () => doEnhance(b.dataset.enh, b)));
+    document.querySelectorAll('[data-nenh]').forEach((b) => (b.onclick = () => doEnhanceNotes(b.dataset.nenh)));
+  }
+  wireEnhButtons();
 
   document.getElementById('shareBtn').onclick = async () => {
     const v = viewMeeting();
@@ -1819,6 +1842,38 @@ async function renderDetail(id) {
       toast(`學習筆記完成（${notes.outline.length} 節、${notes.concepts.length} 個概念、${notes.tables.length} 張表）`);
     } catch (e) {
       alert('產生學習筆記失敗：' + (e && e.message ? e.message : e));
+    }
+  };
+
+  // 加強學習筆記的某一區（分批掃過整份逐字稿，補上一次生成漏掉的）
+  const doEnhanceNotes = async (section) => {
+    const nameMap = { outline: '章節大綱', concepts: '重要概念', tables: '對照表', figures: '關鍵數據', quiz: '自我測驗' };
+    if (!hasApiKey()) {
+      alert('請先到 ⚙︎ 設定填入 Gemini 金鑰');
+      return;
+    }
+    if (!(m.transcript && m.transcript.length)) {
+      alert('這場沒有逐字稿，無法加強');
+      return;
+    }
+    if (detailBusy()) {
+      toast('已有一項作業進行中，請等它完成');
+      return;
+    }
+    if (!confirm(`重新從整份逐字稿抓出「完整的${nameMap[section]}」？會取代目前這一區（其他區不變）。`)) return;
+    try {
+      const items = await runDetailTask(id, 'nenh:' + section, `加強${nameMap[section]}中…`, (setMsg) =>
+        enhanceNotesSection(m.transcript, section, getApiKeyEntries(), { onProgress: (info) => setMsg(info && info.message) })
+      );
+      await persist((fresh) => {
+        fresh.notes = fresh.notes || { outline: [], concepts: [], tables: [], figures: [], quiz: [] };
+        fresh.notes[section] = items;
+        fresh.translations = {}; // 內容改了 → 清掉舊翻譯
+      }, { edit: true });
+      renderDetail(id);
+      toast(`已加強${nameMap[section]}（共 ${items.length} 筆）`);
+    } catch (e) {
+      alert('加強失敗：' + (e && e.message ? e.message : e));
     }
   };
 

@@ -69,8 +69,41 @@ export function meetingToHtmlBody(meeting, opts) {
   if (want.actionItems) html += `<h2>✅ 待辦事項 Action Item</h2>${ol(s.actionItems || [])}`;
   if (want.mainPoints) html += `<h2>📌 會議重點 Main Point</h2>${ol(s.mainPoints || s.keyPoints || [])}`;
   if (want.qa) html += `<h2>❓ 會議提問 Q&amp;A</h2>${qaOl(s.qa || [])}`;
+  if (want.notes) html += notesHtml(meeting.notes);
   if (want.transcript) html += `<h2>🗣️ 逐字稿 Transcribe</h2>${segs || '<p class="none">（無逐字稿）</p>'}`;
   return html;
+}
+
+// 學習筆記（研討會／上課模式）。表格用真正的 <table>，不再壓成散文。
+function notesHtml(n) {
+  if (!n) return '';
+  const none = '<p class="none">（無）</p>';
+  const outline = (n.outline || [])
+    .map((o, i) => `<p class="nt-h">${i + 1}. ${esc(o.title)}</p>${(o.points || []).length ? `<ul>${o.points.map((p) => `<li>${esc(p)}</li>`).join('')}</ul>` : ''}`)
+    .join('');
+  const concepts = (n.concepts || [])
+    .map((c) => `<p class="nt-h">${esc(c.term)}</p><p>${esc(c.plain)}</p>${c.why ? `<p class="nt-why">→ ${esc(c.why)}</p>` : ''}`)
+    .join('');
+  const tables = (n.tables || [])
+    .map((t) => {
+      const head = (t.headers || []).map((h) => `<th>${esc(h)}</th>`).join('');
+      const rows = (t.rows || [])
+        .map((r) => `<tr>${(t.headers || []).map((_, i) => `<td>${esc(r[i] || '')}</td>`).join('')}</tr>`)
+        .join('');
+      return `${t.title ? `<p class="nt-h">${esc(t.title)}</p>` : ''}<table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
+    })
+    .join('');
+  const figures = (n.figures || []).length ? `<ul>${n.figures.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : none;
+  const quiz = (n.quiz || [])
+    .map((q, i) => `<p class="nt-h">Q${i + 1}. ${esc(q.q)}</p><p>${esc(q.a)}</p>`)
+    .join('');
+  return (
+    `<h2>📑 章節大綱 Outline</h2>${outline || none}` +
+    `<h2>💡 重要概念 Concepts</h2>${concepts || none}` +
+    `<h2>📊 對照表 Tables</h2>${tables || none}` +
+    `<h2>🔢 關鍵數據 Key Figures</h2>${figures}` +
+    `<h2>✍️ 自我測驗 Quiz</h2>${quiz || none}`
+  );
 }
 
 const STYLE = `
@@ -80,6 +113,10 @@ const STYLE = `
   h2{font-size:16px;border-bottom:2px solid #0a84ff;padding-bottom:4px;margin:22px 0 8px;color:#0a6;}
   ul{margin:6px 0;padding-left:22px;} li{margin:5px 0;}
   p{margin:6px 0;} .seg{margin:4px 0;} .none{color:#999;}
+  .nt-h{font-weight:700;margin:10px 0 2px;} .nt-why{color:#555;margin:2px 0 8px;}
+  table{border-collapse:collapse;width:100%;margin:6px 0 14px;font-size:14px;page-break-inside:avoid;}
+  th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top;}
+  th{background:#f2f2f2;font-weight:700;}
   @media print{ body{margin:0;} }
 `;
 

@@ -87,7 +87,82 @@ function splitQA(item) {
 export function normalizeSections(opts) {
   const o = opts || {};
   const on = (v) => v !== false;
-  return { actionItems: on(o.actionItems), mainPoints: on(o.mainPoints), qa: on(o.qa), transcript: on(o.transcript) };
+  return {
+    actionItems: on(o.actionItems),
+    mainPoints: on(o.mainPoints),
+    qa: on(o.qa),
+    transcript: on(o.transcript),
+    // 學習筆記預設「不」輸出：它是選用功能，多數會議沒有，預設帶上會讓舊行為改變
+    notes: o.notes === true,
+  };
+}
+
+// ---- Word 表格（OOXML）----
+// docx 的表格是 w:tbl > w:tr > w:tc，每個 w:tc 內至少要有一個 w:p，否則 Word 會判定檔案損毀。
+const TBL_W = 9638; // A4 去掉左右邊界後的可用寬度（twips），欄寬平均分配
+function cell(text, widthTw, bold) {
+  return (
+    `<w:tc><w:tcPr><w:tcW w:w="${widthTw}" w:type="dxa"/>` +
+    `${bold ? '<w:shd w:val="clear" w:color="auto" w:fill="F2F2F2"/>' : ''}</w:tcPr>` +
+    `${para(run(text, { sz: 20, b: !!bold }))}</w:tc>`
+  );
+}
+function tableXml(t) {
+  const headers = (t.headers || []).filter((h) => h != null);
+  if (!headers.length) return '';
+  const w = Math.floor(TBL_W / headers.length);
+  const grid = headers.map(() => `<w:gridCol w:w="${w}"/>`).join('');
+  const borders =
+    '<w:tblBorders>' +
+    ['top', 'left', 'bottom', 'right', 'insideH', 'insideV']
+      .map((s) => `<w:${s} w:val="single" w:sz="4" w:color="BFBFBF"/>`)
+      .join('') +
+    '</w:tblBorders>';
+  const headRow = `<w:tr><w:trPr><w:tblHeader/></w:trPr>${headers.map((h) => cell(h, w, true)).join('')}</w:tr>`;
+  const bodyRows = (t.rows || [])
+    // 依欄位數對齊：缺的補空白，多的截掉，避免產生欄數不一致的破損表格
+    .map((r) => `<w:tr>${headers.map((_, i) => cell((r && r[i]) || '', w, false)).join('')}</w:tr>`)
+    .join('');
+  return (
+    (t.title ? para(run(t.title, { b: true, sz: 22 }), '<w:keepNext/>') : '') +
+    `<w:tbl><w:tblPr><w:tblW w:w="${TBL_W}" w:type="dxa"/>${borders}</w:tblPr>` +
+    `<w:tblGrid>${grid}</w:tblGrid>${headRow}${bodyRows}</w:tbl>` +
+    para(run('', { sz: 12 })) // 表格後補一段空行，Word 不允許兩個表格直接相鄰
+  );
+}
+
+function notesBody(n) {
+  const body = [];
+  const none = () => body.push(line('（無）'));
+  body.push(heading('📑 章節大綱 Outline'));
+  if ((n.outline || []).length) {
+    n.outline.forEach((o, i) => {
+      body.push(para(run(`${i + 1}. ${o.title}`, { b: true }), '<w:keepNext/>'));
+      (o.points || []).forEach((p) => body.push(line(`　・${p}`)));
+    });
+  } else none();
+  body.push(heading('💡 重要概念 Concepts'));
+  if ((n.concepts || []).length) {
+    n.concepts.forEach((c) => {
+      body.push(para(run(c.term, { b: true }), '<w:keepNext/>'));
+      body.push(line(c.plain || ''));
+      if (c.why) body.push(line(`→ ${c.why}`, 20));
+    });
+  } else none();
+  body.push(heading('📊 對照表 Tables'));
+  if ((n.tables || []).length) n.tables.forEach((t) => body.push(tableXml(t)));
+  else none();
+  body.push(heading('🔢 關鍵數據 Key Figures'));
+  if ((n.figures || []).length) n.figures.forEach((f, i) => body.push(line(`${i + 1}. ${f}`)));
+  else none();
+  body.push(heading('✍️ 自我測驗 Quiz'));
+  if ((n.quiz || []).length) {
+    n.quiz.forEach((q, i) => {
+      body.push(para(run(`Q${i + 1}. ${q.q}`, { b: true }), '<w:keepNext/>'));
+      body.push(line(q.a || ''));
+    });
+  } else none();
+  return body;
 }
 
 function documentXml(meeting, opts) {
@@ -122,6 +197,7 @@ function documentXml(meeting, opts) {
       });
     } else body.push(line('無'));
   }
+  if (want.notes && meeting.notes) body.push(...notesBody(meeting.notes));
   if (want.transcript) {
     body.push(heading('🗣️ 逐字稿 Transcribe'));
     const segs = meeting.transcript || [];

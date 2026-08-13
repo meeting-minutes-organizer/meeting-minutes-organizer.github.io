@@ -1021,6 +1021,89 @@ export async function generateNotes(segments, apiKeys, opts = {}) {
   return normalizeNotes(r);
 }
 
+// 學習筆記的分區加強：一次生成是「整份讀完憑印象整理」，長課程必漏。
+// 這裡分批掃過整份逐字稿，確保每一段都被讀到，再跨批合併去重。
+const NOTES_SECTIONS = {
+  outline: { label: '章節大綱', instr: '列出這段講述的章節。title 為 8～20 字主題；points 為該節重點；anchor 填該節開始處逐字稿中的一句原話（10～20 字，必須真的出現過）' },
+  concepts: { label: '重要概念', instr: '挑出這段出現、需要理解的名詞或機制。term＝名詞；plain＝白話說明；why＝為什麼重要' },
+  tables: { label: '對照表', instr: '把這段中「多項目 × 多屬性」的內容還原成表格。rows 每列長度必須與 headers 相同；沒有就回空陣列，不要硬湊' },
+  figures: { label: '關鍵數據', instr: '列出這段出現的具體數字，連同單位與脈絡' },
+  quiz: { label: '自我測驗', instr: '依這段內容出題幫助主動回想；答案必須在這段裡找得到依據' },
+};
+
+export async function enhanceNotesSection(segments, section, apiKeys, opts = {}) {
+  const meta = NOTES_SECTIONS[section];
+  if (!meta) throw new Error('未知的區塊');
+  const onProgress = opts.onProgress;
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+  const model = await resolveModel(kos.map((k) => k.key), { preferLite: false });
+  const variants = kos.map((k) => ({ key: k.key, name: k.name }));
+  const schema = { type: 'object', properties: { [section]: NOTES_SCHEMA.properties[section] }, required: [section] };
+  const segs = segments || [];
+  const BATCH = 80;
+  const nb = Math.max(1, Math.ceil(segs.length / BATCH));
+  const all = [];
+  for (let i = 0; i < segs.length; i += BATCH) {
+    const text = segs.slice(i, i + BATCH).map((s) => `${s.speaker}：${s.text}`).join('\n');
+    const prompt =
+      `以下是一場研討會／課程逐字稿的其中一段。請${meta.instr}。` +
+      `使用與逐字稿相同的主要語言，忠於逐字稿、不可自行補充沒講到的內容。` +
+      `這段沒有相關內容就回空陣列。只輸出 JSON {"${section}":[...]}。\n\n逐字稿：\n` +
+      text;
+    const res = await postJsonRotating(
+      variants,
+      (v) => ({
+        url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: 'application/json', responseSchema: schema, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
+        }),
+      }),
+      onProgress,
+      `加強${meta.label}中…（${Math.floor(i / BATCH) + 1}/${nb}）`
+    );
+    const data = await res.json();
+    const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    if (!out) throw new Error(`加強${meta.label}時第 ${Math.floor(i / BATCH) + 1} 批無回應，請重試`);
+    let r;
+    try {
+      r = JSON.parse(out);
+    } catch (_) {
+      throw new Error(`加強${meta.label}時第 ${Math.floor(i / BATCH) + 1} 批解析失敗，請重試`);
+    }
+    all.push(...normalizeNotes({ [section]: r[section] })[section]);
+  }
+  return dedupeNotesItems(section, all);
+}
+
+// 跨批合併：各區的「同一件事」判準不同
+export function dedupeNotesItems(section, all) {
+  if (section === 'outline') {
+    // 章節有順序，不可重排；只把相鄰的同名章節併起來（同一主題被切在兩批）
+    const out = [];
+    for (const o of all) {
+      const prev = out[out.length - 1];
+      if (prev && prev.title === o.title) {
+        prev.points = prev.points.concat((o.points || []).filter((p) => !prev.points.includes(p)));
+        continue; // anchor 保留最先出現的（那才是這節真正的開頭）
+      }
+      out.push({ ...o, points: (o.points || []).slice() });
+    }
+    return out;
+  }
+  const keyOf = { concepts: (x) => x.term, tables: (x) => x.title, quiz: (x) => x.q, figures: (x) => x };
+  const seen = new Set();
+  const out = [];
+  for (const x of all) {
+    const k = keyOf[section](x);
+    if (!k || seen.has(k)) continue; // 先出現的保留
+    seen.add(k);
+    out.push(x);
+  }
+  return out;
+}
+
 // ---- 翻譯（純文字，很省）：固定用品質模型；逐字稿分批翻避免超過輸出上限 ----
 const LANG_LABEL = { zh: '繁體中文 (Traditional Chinese)', en: 'English', ja: '日本語 (Japanese)' };
 const SUMMARY_TR_SCHEMA = {
@@ -1093,6 +1176,30 @@ export async function translateMeeting(transcript, summary, targetLang, apiKeys,
     `翻譯摘要成 ${label}…`
   );
 
+  // 1b) 學習筆記（有才翻；結構固定，交給同一套「只翻值、不動結構」的流程）
+  let notesOut = null;
+  const srcNotes = opts.notes;
+  const hasNotes =
+    srcNotes && ['outline', 'concepts', 'tables', 'figures', 'quiz'].some((k) => (srcNotes[k] || []).length);
+  if (hasNotes) {
+    const raw = await translatePayload(
+      variants,
+      model,
+      label,
+      {
+        outline: srcNotes.outline || [],
+        concepts: srcNotes.concepts || [],
+        tables: srcNotes.tables || [],
+        figures: srcNotes.figures || [],
+        quiz: srcNotes.quiz || [],
+      },
+      NOTES_SCHEMA,
+      onProgress,
+      `翻譯學習筆記成 ${label}…`
+    );
+    notesOut = normalizeNotes(raw);
+  }
+
   // 2) 逐字稿（分批，避免長逐字稿超過輸出上限被截斷）
   const segs = transcript || [];
   const BATCH = 60;
@@ -1115,5 +1222,6 @@ export async function translateMeeting(transcript, summary, targetLang, apiKeys,
   return {
     transcript: outSegs,
     summary: { actionItems: sumOut.actionItems || [], mainPoints: sumOut.mainPoints || [], qa: sumOut.qa || [] },
+    ...(notesOut ? { notes: notesOut } : {}),
   };
 }
