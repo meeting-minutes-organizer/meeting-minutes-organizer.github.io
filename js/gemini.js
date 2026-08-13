@@ -299,6 +299,8 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       }
       // 400 INVALID_ARGUMENT：常見於新模型不接受 thinkingBudget:0（強制思考）。
       // 自動改成「不帶 thinkingConfig」重試一次；成功就記住，本階段之後都不再送。
+      // 真正要據以判斷的狀態：若下面做了去 thinkingConfig 的重試，改看那一次的結果
+      let effStatus = res.status;
       if (res.status === 400 && !thinkingRejected && /thinking/i.test(body)) {
         try {
           const alt = JSON.parse(body);
@@ -310,12 +312,30 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
           }
           lastText = await res2.text();
           lastStatus = res2.status;
+          effStatus = res2.status; // 例如原本 400、重試後變 429（額度用盡）
         } catch (_) {}
       }
-      if (res.status === 400) {
-        throw new Error(`${act}失敗 (400)：這個檔案可能格式不支援或已損毀，建議換一個音檔（m4a／mp3／wav）再試。原始訊息：${lastText.slice(0, 200)}`);
+      // 重試後若變成額度／伺服器問題 → 回到輪替流程換金鑰或等待，不能當成致命錯誤丟出
+      if (effStatus !== res.status && isTransientStatus(effStatus)) {
+        sawTransient = true;
+        if (effStatus === 429) {
+          const d = parseRetryDelayMs(lastText);
+          retryMs = Math.max(retryMs, d);
+          if (v.key) recordCooldown(v.key, d || 30000);
+        }
+        continue;
       }
-      throw new Error(`${act}失敗 (${res.status})：${lastText.slice(0, 300)}`);
+      if (effStatus === 400) {
+        // 「換一個音檔」只在請求真的帶了音檔時才是有效建議；
+        // 摘要／加強／翻譯／問答都是純文字，講音檔只會誤導（使用者會以為它又去讀錄音）。
+        const hasAudio = /file_data|fileData/.test(body);
+        throw new Error(
+          hasAudio
+            ? `${act}失敗 (400)：這個檔案可能格式不支援或已損毀，建議換一個音檔（m4a／mp3／wav）再試。原始訊息：${lastText.slice(0, 200)}`
+            : `${act}失敗 (400)：請求被拒絕。原始訊息：${lastText.slice(0, 200)}`
+        );
+      }
+      throw new Error(`${act}失敗 (${effStatus})：${lastText.slice(0, 300)}`);
     }
     if (!sawTransient || round >= MAX_ROUNDS) break;
     const wait = Math.min(35000, retryMs || 8000 * (round + 1));
