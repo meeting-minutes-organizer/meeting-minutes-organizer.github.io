@@ -93,7 +93,29 @@ function notesHtml(n) {
       return `${t.title ? `<p class="nt-h">${esc(t.title)}</p>` : ''}<table><thead><tr>${head}</tr></thead><tbody>${rows}</tbody></table>`;
     })
     .join('');
-  const figures = (n.figures || []).length ? `<ul>${n.figures.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : none;
+  // 關鍵數據：依主題分組，標籤在左、數值靠右——同主題的數字排在一起才好互相對照
+  const figs = n.figures || [];
+  let figures = none;
+  if (figs.length) {
+    const order = [];
+    const byGroup = new Map();
+    for (const f of figs) {
+      const g = (f && f.group) || '其他';
+      if (!byGroup.has(g)) {
+        byGroup.set(g, []);
+        order.push(g);
+      }
+      byGroup.get(g).push(f);
+    }
+    figures = order
+      .map(
+        (g) =>
+          `${order.length > 1 ? `<p class="nt-h">${esc(g)}</p>` : ''}<table class="fig"><tbody>` +
+          byGroup.get(g).map((f) => `<tr><td>${esc(f.label)}</td><td class="fv">${esc(f.value)}</td></tr>`).join('') +
+          `</tbody></table>`
+      )
+      .join('');
+  }
   const quiz = (n.quiz || [])
     .map((q, i) => `<p class="nt-h">Q${i + 1}. ${esc(q.q)}</p><p>${esc(q.a)}</p>`)
     .join('');
@@ -117,6 +139,8 @@ const STYLE = `
   table{border-collapse:collapse;width:100%;margin:6px 0 14px;font-size:14px;page-break-inside:avoid;}
   th,td{border:1px solid #ccc;padding:6px 8px;text-align:left;vertical-align:top;}
   th{background:#f2f2f2;font-weight:700;}
+  table.fig td{border:none;border-bottom:1px dashed #ddd;padding:5px 0;}
+  table.fig td.fv{text-align:right;font-weight:700;white-space:nowrap;padding-left:14px;}
   @media print{ body{margin:0;} }
 `;
 

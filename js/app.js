@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v71';
+const APP_VERSION = 'v72';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -75,7 +75,9 @@ export function applyTermInNotes(notes, fix) {
     t.headers = (t.headers || []).map(f);
     t.rows = (t.rows || []).map((r) => (Array.isArray(r) ? r.map(f) : r));
   });
-  notes.figures = (notes.figures || []).map(f);
+  notes.figures = (notes.figures || []).map((x) =>
+    typeof x === 'string' ? f(x) : { ...x, group: f(x.group), label: f(x.label), value: f(x.value) }
+  );
   (notes.quiz || []).forEach((q) => {
     q.q = f(q.q);
     q.a = f(q.a);
@@ -1370,9 +1372,35 @@ async function renderDetail(id) {
       )
       .join('');
     const tables = (n.tables || []).map((t, i) => tableHtml(t, ed('nt-t') ? delBtn('nt-t', i) : '')).join('');
-    const figures = (n.figures || []).length
-      ? `<ul class="list${ed('nt-f') ? ' editing' : ''}">${n.figures.map((f, i) => `<li>${esc(f)}${ed('nt-f') ? delBtn('nt-f', i) : ''}</li>`).join('')}</ul>`
-      : '';
+    // 依 group 分組顯示：同主題的數字排在一起才能互相對照；標籤在左、數值靠右對齊便於掃描
+    const figs = n.figures || [];
+    let figures = '';
+    if (figs.length) {
+      const order = [];
+      const byGroup = new Map();
+      figs.forEach((f, i) => {
+        const g = (f && f.group) || '其他';
+        if (!byGroup.has(g)) {
+          byGroup.set(g, []);
+          order.push(g);
+        }
+        byGroup.get(g).push([f, i]);
+      });
+      figures = order
+        .map(
+          (g) =>
+            `${order.length > 1 ? `<div class="fig-g">${esc(g)}</div>` : ''}` +
+            byGroup
+              .get(g)
+              .map(
+                ([f, i]) =>
+                  `<div class="fig-row"><span class="fig-l">${esc(f.label)}</span>` +
+                  `<span class="fig-v">${esc(f.value)}</span>${ed('nt-f') ? delBtn('nt-f', i) : ''}</div>`
+              )
+              .join('')
+        )
+        .join('');
+    }
     const quiz = (n.quiz || [])
       .map((x, i) => `<div class="nt-quiz"><div class="nt-q">Q${i + 1}. ${esc(x.q)}${ed('nt-q') ? delBtn('nt-q', i) : ''}</div><div class="nt-a">${esc(x.a)}</div></div>`)
       .join('');
@@ -1555,7 +1583,7 @@ async function renderDetail(id) {
       'nt-t': (nt.tables || [])
         .map((t) => [t.title, t.headers.join('\t'), ...t.rows.map((r) => r.join('\t'))].filter(Boolean).join('\n'))
         .join('\n\n'),
-      'nt-f': numbered(nt.figures || []),
+      'nt-f': (nt.figures || []).map((f) => `${f.group ? `[${f.group}] ` : ''}${f.label}：${f.value}`).join('\n'),
       'nt-q': (nt.quiz || []).map((x, i) => `Q${i + 1}. ${x.q}\nA. ${x.a}`).join('\n\n'),
     };
     bodyEl.querySelectorAll('.copy').forEach((b) => {

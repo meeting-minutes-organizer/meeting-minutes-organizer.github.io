@@ -131,6 +131,27 @@ function tableXml(t) {
   );
 }
 
+// 關鍵數據的兩欄表：左欄標籤、右欄數值靠右
+function figTableXml(rows) {
+  const LW = Math.floor(TBL_W * 0.68);
+  const RW = TBL_W - LW;
+  const borders =
+    '<w:tblBorders><w:insideH w:val="dashed" w:sz="4" w:color="D9D9D9"/></w:tblBorders>';
+  const trs = rows
+    .map(
+      (f) =>
+        `<w:tr><w:tc><w:tcPr><w:tcW w:w="${LW}" w:type="dxa"/></w:tcPr>${para(run(f.label || '', { sz: 20 }))}</w:tc>` +
+        `<w:tc><w:tcPr><w:tcW w:w="${RW}" w:type="dxa"/></w:tcPr>` +
+        `${para(run(f.value || '', { sz: 20, b: true }), '<w:jc w:val="right"/>')}</w:tc></w:tr>`
+    )
+    .join('');
+  return (
+    `<w:tbl><w:tblPr><w:tblW w:w="${TBL_W}" w:type="dxa"/>${borders}</w:tblPr>` +
+    `<w:tblGrid><w:gridCol w:w="${LW}"/><w:gridCol w:w="${RW}"/></w:tblGrid>${trs}</w:tbl>` +
+    para(run('', { sz: 12 }))
+  );
+}
+
 function notesBody(n) {
   const body = [];
   const none = () => body.push(line('（無）'));
@@ -153,8 +174,24 @@ function notesBody(n) {
   if ((n.tables || []).length) n.tables.forEach((t) => body.push(tableXml(t)));
   else none();
   body.push(heading('🔢 關鍵數據 Key Figures'));
-  if ((n.figures || []).length) n.figures.forEach((f, i) => body.push(line(`${i + 1}. ${f}`)));
-  else none();
+  const figs = n.figures || [];
+  if (figs.length) {
+    const order = [];
+    const byGroup = new Map();
+    for (const f of figs) {
+      const g = (f && f.group) || '其他';
+      if (!byGroup.has(g)) {
+        byGroup.set(g, []);
+        order.push(g);
+      }
+      byGroup.get(g).push(f);
+    }
+    for (const g of order) {
+      if (order.length > 1) body.push(para(run(g, { b: true }), '<w:keepNext/>'));
+      // 用兩欄表格達成「標籤左、數值右」；無框線，只留底部虛線的視覺分隔
+      body.push(figTableXml(byGroup.get(g)));
+    }
+  } else none();
   body.push(heading('✍️ 自我測驗 Quiz'));
   if ((n.quiz || []).length) {
     n.quiz.forEach((q, i) => {

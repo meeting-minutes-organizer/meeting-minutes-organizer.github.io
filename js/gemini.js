@@ -1021,7 +1021,17 @@ const FIGURE_RULE =
 ` +
   `  (c) 沒有單位也沒有比較基準的孤立數字。
 ` +
-  `每筆都要寫成「數值＋單位：這個數字在講什麼」，例如「1600 W：全鋁方案的實測解熱能力」。
+  `每筆拆成三欄：label＝這個數字在講什麼（主題在前，不含數字）；value＝數值連同單位；
+` +
+  `group＝主題分組名稱（4～8 字，例如「市場規模」「產能與良率」「公司與團隊」「技術規格」），
+` +
+  `同一類的數據要用「完全相同」的 group 名稱，讓它們能排在一起互相對照。
+` +
+  `例如 {"group":"市場規模","label":"2030 年 FOPLP／GCS 預估","value":"81.1 億美元"}。
+` +
+  `⚠️ 若一筆數據本質是「A 與 B 的對比」（例如 620×750 mm 可容納 9 個、300×300 mm 只能容納 1 個），
+` +
+  `不要硬塞成一行關鍵數據，改整理到「對照表」裡。
 `;
 
 const NOTES_SCHEMA = {
@@ -1055,7 +1065,14 @@ const NOTES_SCHEMA = {
         required: ['title', 'headers', 'rows'],
       },
     },
-    figures: { type: 'array', items: { type: 'string' } },
+    figures: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { group: { type: 'string' }, label: { type: 'string' }, value: { type: 'string' } },
+        required: ['label', 'value'],
+      },
+    },
     quiz: {
       type: 'array',
       items: { type: 'object', properties: { q: { type: 'string' }, a: { type: 'string' } }, required: ['q', 'a'] },
@@ -1099,7 +1116,17 @@ export function normalizeNotes(r) {
         return { title: asStr(t && t.title), headers, rows };
       })
       .filter((t) => t.headers.length && t.rows.length), // 沒有資料列的表格不留空殼
-    figures: asArr(o.figures).map(asStr).filter(Boolean),
+    figures: asArr(o.figures)
+      .map((f) => {
+        // 舊資料是「數值：說明」的純字串 → 轉成標籤在前、數值在後的新結構
+        if (typeof f === 'string') {
+          const t = f.trim();
+          const m = t.match(/^([^：:]{1,24})[：:]\s*(.+)$/);
+          return m ? { group: '', label: m[2].trim(), value: m[1].trim() } : { group: '', label: t, value: '' };
+        }
+        return { group: asStr(f && f.group), label: asStr(f && f.label), value: asStr(f && f.value) };
+      })
+      .filter((f) => f.label),
     quiz: asArr(o.quiz)
       .map((x) => ({ q: asStr(x && x.q), a: asStr(x && x.a) }))
       .filter((x) => x.q),
@@ -1215,7 +1242,7 @@ export function dedupeNotesItems(section, all) {
     }
     return out;
   }
-  const keyOf = { concepts: (x) => x.term, tables: (x) => x.title, quiz: (x) => x.q, figures: (x) => x };
+  const keyOf = { concepts: (x) => x.term, tables: (x) => x.title, quiz: (x) => x.q, figures: (x) => (x && x.label) || '' };
   const seen = new Set();
   const out = [];
   for (const x of all) {
