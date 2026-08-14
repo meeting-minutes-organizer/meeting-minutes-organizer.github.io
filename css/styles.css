@@ -292,7 +292,15 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 0
 /* 表格一定要能單獨橫向捲動，否則寬表會把整頁撐出橫向捲軸 */
 .nt-table-scroll { overflow-x: auto; -webkit-overflow-scrolling: touch; border: 1px solid var(--line); border-radius: 10px; }
 .nt-table table { border-collapse: collapse; width: 100%; font-size: 14px; }
-.nt-table th, .nt-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--line); white-space: nowrap; }
+/* 儲存格可換行：兩三欄的表格在手機上就完整顯示，不必橫向捲動 */
+.nt-table th, .nt-table td { padding: 8px 10px; text-align: left; border-bottom: 1px solid var(--line); vertical-align: top; word-break: break-word; }
+.nt-table table { table-layout: auto; }
+/* 真的很寬的表格才需要捲；右緣加漸層提示「還有更多」，捲到底就消失 */
+.nt-table-scroll { position: relative; }
+.nt-table-scroll.more::after {
+  content: ''; position: absolute; top: 0; right: 0; width: 26px; height: 100%;
+  pointer-events: none; background: linear-gradient(to right, transparent, var(--card));
+}
 .nt-table th { background: var(--bg); font-weight: 700; }
 .nt-table tr:last-child td { border-bottom: none; }
 .nt-quiz { padding: 10px; margin-bottom: 8px; background: var(--bg); border-radius: 10px; }

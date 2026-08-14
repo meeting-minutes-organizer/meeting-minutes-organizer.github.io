@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v73';
+const APP_VERSION = 'v74';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1306,8 +1306,11 @@ async function renderDetail(id) {
     }
   };
   let mode = getModeMap()[id] === 'notes' ? 'notes' : 'meeting';
-  const setMode = (v) => {
-    mode = v === 'notes' ? 'notes' : 'meeting';
+  const setMode = (v, force) => {
+    const next = v === 'notes' ? 'notes' : 'meeting';
+    // 模式沒變就別重繪：重繪會把表格的橫向捲動位置歸零，看起來像「滑一下就彈回去」
+    if (!force && next === mode && bodyEl.childElementCount) return;
+    mode = next;
     const mm = getModeMap();
     mm[id] = mode;
     localStorage.setItem(MODE_KEY, JSON.stringify(mm));
@@ -1627,6 +1630,13 @@ async function renderDetail(id) {
         drawBody(lang);
         toast(merge ? '已合併兩版（重複的已去除）' : '已換版');
       };
+    });
+
+    // 寬表格才顯示右緣漸層提示；捲到底就移除
+    bodyEl.querySelectorAll('.nt-table-scroll').forEach((el) => {
+      const upd = () => el.classList.toggle('more', el.scrollWidth - el.clientWidth - el.scrollLeft > 4);
+      el.onscroll = upd;
+      upd();
     });
 
     const gn = document.getElementById('genNotes');
@@ -2188,22 +2198,32 @@ async function renderDetail(id) {
   });
   let sx = 0;
   let sy = 0;
+  // 起點若落在可橫向捲動的元素內（例如寬表格），這一次滑動屬於那個元素，不能拿來切換模式
+  const inScrollableX = (el) => {
+    for (let n = el; n && n !== bodyEl; n = n.parentElement) {
+      if (n.scrollWidth > n.clientWidth + 1) {
+        const ox = getComputedStyle(n).overflowX;
+        if (ox === 'auto' || ox === 'scroll') return true;
+      }
+    }
+    return false;
+  };
   bodyEl.addEventListener('touchstart', (e) => {
     const t = e.touches && e.touches[0];
     if (!t) return;
-    sx = t.clientX;
+    sx = inScrollableX(e.target) ? -1 : t.clientX; // -1 → 這次不判定為切換手勢
     sy = t.clientY;
   }, { passive: true });
   bodyEl.addEventListener('touchend', (e) => {
     const t = e.changedTouches && e.changedTouches[0];
-    if (!t || sx < 40 || sx > window.innerWidth - 40) return; // 從邊緣起手 → 交給系統返回手勢
+    if (!t || sx < 40 || sx > window.innerWidth - 40) return; // 起點在邊緣或可橫捲區 → 不判定為切換手勢
     const dx = t.clientX - sx;
     const dy = t.clientY - sy;
     if (Math.abs(dx) < 60 || Math.abs(dx) < Math.abs(dy) * 1.5) return; // 要夠橫、夠長才算滑動
     setMode(dx < 0 ? 'notes' : 'meeting');
   }, { passive: true });
 
-  setMode(mode); // 套用記住的模式（同時會畫出內容）
+  setMode(mode, true); // 套用記住的模式（同時會畫出內容）
   // 重繪後把仍在跑的作業狀態畫回按鈕（離開再回來時才看得出它還在跑）
   paintDetailTasks();
 }
