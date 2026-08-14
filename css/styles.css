@@ -305,3 +305,11 @@ code { background: var(--bg); padding: 1px 5px; border-radius: 4px; font-size: 0
 .time-mark::after { content: ''; flex: 1; height: 1px; background: var(--line); }
 mark.hit { background: #ffe58a; color: #1c1c1e; border-radius: 3px; padding: 0 2px; }
 @media (prefers-color-scheme: dark) { mark.hit { background: #7a5c00; color: #fff; } }
+
+/* 專有名詞：同一實體的多種寫法 */
+.term-alts { color: var(--muted); font-weight: 400; }
+.term-alt-box { margin: 8px 0 4px; padding: 8px 10px; background: var(--bg); border-radius: 10px; }
+.term-alt-t { font-size: 13px; color: var(--muted); margin-bottom: 6px; }
+.term-alt { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 15px; }
+.term-alt input { width: 18px; height: 18px; }
+.term-alt-n { color: var(--muted); font-size: 13px; }

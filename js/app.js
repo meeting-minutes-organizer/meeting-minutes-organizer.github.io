@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v69';
+const APP_VERSION = 'v70';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1637,6 +1637,10 @@ async function renderDetail(id) {
     const SENT = '';
     return String(text == null ? '' : text).split(newV).join(SENT).split(oldV).join(newV).split(SENT).join(newV);
   };
+  // 一筆訂正可能對應多種寫法（同一個名字被聽成好幾種），全部一起取代
+  const applyTermAll = (fresh, olds, newV) => {
+    for (const o of olds) if (o && o !== newV) applyTerm(fresh, o, newV);
+  };
   const applyTerm = (fresh, oldV, newV) => {
     (fresh.transcript || []).forEach((s) => { s.text = protectedReplace(s.text, oldV, newV); });
     const s = fresh.summary || {};
@@ -1684,7 +1688,10 @@ async function renderDetail(id) {
         if (it.applied) {
           return `<div class="term-row done" data-i="${i}">${chip}<span class="term-pair"><span class="term-old">${esc(it.t)}</span><span class="term-arrow">→</span><span class="term-new">${esc(it.applied)}</span></span><span class="term-tick">✓</span></div>`;
         }
-        return `<div class="term-row" data-i="${i}">${chip}<span class="term-word">${esc(it.t)}</span><span class="term-go">訂正 ›</span></div>`;
+        const alt = (it.alts || []).length
+          ? `<span class="term-alts">／${it.alts.map(esc).join('／')}</span>`
+          : '';
+        return `<div class="term-row" data-i="${i}">${chip}<span class="term-word">${esc(it.t)}${alt}</span><span class="term-go">訂正 ›</span></div>`;
       })
       .join('');
     termsBody.innerHTML = `
@@ -1713,9 +1720,19 @@ async function renderDetail(id) {
     const curOld = it ? termCurrent(it) : '';
     const prefill = it ? (it.draft || it.fix || termCurrent(it)) : '';
     const row = idx >= 0 ? termsBody.querySelector(`.term-row[data-i="${idx}"]`) : null;
+    // 同一個名字常被聽成好幾種寫法 → 預設一起改；但 AI 可能把「同音但其實不同」的誤歸一組，
+    // 所以每個變體都給勾選框，取消勾選的會拆成獨立一列自己處理。
+    const alts = (it && it.alts) || [];
+    const altsHtml = alts.length
+      ? `<div class="term-alt-box"><div class="term-alt-t">這些寫法會一起改成上面的正確寫法：</div>` +
+        `<label class="term-alt"><input type="checkbox" checked disabled /> ${esc(termCurrent(it))}<span class="term-alt-n">（主要寫法）</span></label>` +
+        alts.map((a) => `<label class="term-alt"><input type="checkbox" class="alt-ck" data-alt="${esc(a)}" checked /> ${esc(a)}</label>`).join('') +
+        `<div class="hint" style="margin:4px 0 0">若某個寫法其實是<b>別的東西</b>，取消勾選，它會變成獨立一列。</div></div>`
+      : '';
     const editorHtml = `<div class="term-editor">
       ${idx < 0 ? '<input class="term-input" id="tOld" placeholder="辨識錯的字（原文中的寫法）" />' : ''}
       <input class="term-input" id="tNew" placeholder="正確的寫法" value="${esc(prefill)}" />
+      ${altsHtml}
       <div class="term-edit-ops"><button class="act-btn primary" id="tSave">${idx < 0 ? '加入清單' : '暫存這筆'}</button><button class="act-btn" id="tCancel">取消</button></div>
       <div class="hint" style="margin:2px 0 0">先暫存，最後按「套用全部訂正」才會真正改動全文。</div>
     </div>`;
@@ -1738,6 +1755,17 @@ async function renderDetail(id) {
         fresh.terms.items = fresh.terms.items || [];
         const target = key ? fresh.terms.items.find((x) => x && x.t === key) : null;
         if (target) {
+          // 被取消勾選的變體：從這一組移出，變成獨立一列（AI 誤歸組時的逃生口）
+          if ((target.alts || []).length) {
+            const kept = Array.from(box.querySelectorAll('.alt-ck')).filter((c) => c.checked).map((c) => c.dataset.alt);
+            const dropped = (target.alts || []).filter((a) => !kept.includes(a));
+            target.alts = kept;
+            for (const d of dropped) {
+              if (!fresh.terms.items.some((x) => x && x.t === d)) {
+                fresh.terms.items.push({ t: d, cat: target.cat || 'term', fix: '', alts: [] });
+              }
+            }
+          }
           if (!newV || newV === termCurrent(target)) delete target.draft;
           else target.draft = newV;
         } else if (newV && newV !== oldV) {
@@ -1755,7 +1783,7 @@ async function renderDetail(id) {
     await persist((fresh) => {
       for (const it of fresh.terms.items) {
         if (it.draft && it.draft !== termCurrent(it)) {
-          applyTerm(fresh, termCurrent(it), it.draft);
+          applyTermAll(fresh, [termCurrent(it), ...(it.alts || [])], it.draft);
           it.applied = it.draft;
           delete it.draft;
         }

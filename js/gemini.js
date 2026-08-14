@@ -923,7 +923,85 @@ export async function extractTerms(segments, apiKeys, opts = {}) {
       }
     } catch (_) {}
   }
-  return Array.from(map.values());
+  const items = Array.from(map.values());
+  if (items.length < 2) return items;
+  return await groupTermVariants(items, variants, model, onProgress);
+}
+
+// 同一個名字常被聽成好幾種寫法（合訊／和迅／禾訊），而且往往散在不同批次，
+// 批次內看不到彼此。這裡拿「全部詞彙」再問一次，把同一實體的寫法歸成一組：
+// 之後訂正一次就能把所有寫法一起改掉，不必自己一個個發現、一個個補。
+const GROUP_SCHEMA = {
+  type: 'object',
+  properties: {
+    groups: {
+      type: 'array',
+      items: {
+        type: 'object',
+        properties: { terms: { type: 'array', items: { type: 'string' } }, best: { type: 'string' } },
+        required: ['terms'],
+      },
+    },
+  },
+  required: ['groups'],
+};
+
+async function groupTermVariants(items, variants, model, onProgress) {
+  const list = items.map((x) => x.t);
+  const prompt =
+    `以下是同一場會議逐字稿裡挑出的專有名詞清單。語音辨識常把同一個名字聽成好幾種寫法。\n` +
+    `請找出「其實指同一個實體」的寫法，把它們歸成一組。\n` +
+    `- 只在你有把握是同一個實體時才歸組（發音相近、字形相近、上下文明顯同指）。不確定就不要歸。\n` +
+    `- 每組的 terms 只能填「清單裡出現過的字串」，不可自行新增。\n` +
+    `- best 填這一組最可能的正確寫法（可以是清單裡沒有的正確字），無法判斷就留空字串。\n` +
+    `- 只有一種寫法、沒有變體的詞，不要放進 groups。\n` +
+    `只輸出 JSON {"groups":[{"terms":["…","…"],"best":"…"}]}。\n\n清單：\n` +
+    list.map((t) => `- ${t}`).join('\n');
+  let groups = [];
+  try {
+    const res = await postJsonRotating(
+      variants,
+      (v) => ({
+        url: `${BASE}/v1beta/models/${model}:generateContent?key=${v.key}`,
+        body: JSON.stringify({
+          contents: [{ parts: [{ text: prompt }] }],
+          generationConfig: { responseMimeType: 'application/json', responseSchema: GROUP_SCHEMA, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
+        }),
+      }),
+      onProgress,
+      '比對同一名稱的不同寫法…'
+    );
+    const data = await res.json();
+    const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    groups = (JSON.parse(out).groups) || [];
+  } catch (_) {
+    return items.map((x) => ({ ...x, alts: [] })); // 分組失敗不影響主流程
+  }
+  return mergeTermGroups(items, groups);
+}
+
+// 依分組結果合併：主寫法取「最先出現的那個」，其餘進 alts；best 當作建議寫法
+export function mergeTermGroups(items, groups) {
+  const byTerm = new Map(items.map((x) => [x.t, x]));
+  const takenBy = new Map(); // 變體 → 主寫法
+  const altsOf = new Map(); // 主寫法 → 變體清單
+  for (const g of groups || []) {
+    // 只認清單裡真的存在、且尚未被別組認領的詞（防模型憑空生詞或重複歸組）
+    const terms = (g && Array.isArray(g.terms) ? g.terms : [])
+      .map((t) => String(t || '').trim())
+      .filter((t) => byTerm.has(t) && !takenBy.has(t));
+    if (terms.length < 2) continue;
+    const head = items.find((x) => terms.includes(x.t)).t; // 依原順序取最先出現的當主寫法
+    const rest = terms.filter((t) => t !== head);
+    rest.forEach((t) => takenBy.set(t, head));
+    takenBy.set(head, head);
+    altsOf.set(head, rest);
+    const best = String((g && g.best) || '').trim();
+    if (best) byTerm.get(head).fix = best;
+  }
+  return items
+    .filter((x) => !takenBy.has(x.t) || takenBy.get(x.t) === x.t)
+    .map((x) => ({ ...x, alts: altsOf.get(x.t) || [] }));
 }
 
 // ---- 學習筆記（研討會／上課用）----
