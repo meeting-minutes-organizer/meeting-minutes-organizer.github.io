@@ -151,7 +151,7 @@ input[type=file] { width: 100%; font-size: 15px; margin: 10px 0; color: var(--in
 .file-pick:active { transform: scale(0.99); }
 .file-pick.picked { border-style: solid; background: color-mix(in srgb, var(--brand) 14%, transparent); }
 .file-pick.picked .fp-name { color: var(--ink); font-weight: 600; }
-.section-title { font-weight: 600; margin: 18px 4px 8px; display: flex; justify-content: space-between; align-items: center; font-size: 15px; }
+.section-title { font-weight: 600; margin: 18px 4px 8px; display: flex; justify-content: space-between; align-items: center; font-size: 15px; flex-wrap: wrap; gap: 6px 8px; }
 ul.list, ol.list { margin: 0; padding-left: 22px; }
 ul.list li, ol.list li { margin: 6px 0; line-height: 1.5; }
 ol.list.qa li { margin: 10px 0; }
@@ -200,8 +200,10 @@ ol.list.qa li { margin: 10px 0; }
 
 /* ---- 區塊摺疊 + 條目跳出處 ---- */
 .sec-head { cursor: pointer; user-select: none; -webkit-user-select: none; }
-.sec-head .sec-t { flex: 1 1 auto; }
-.sec-right { display: flex; align-items: center; gap: 8px; flex: 0 0 auto; }
+/* 標題不換行、放不下就截斷；工具鈕多到擠不下時整組落到第二行，不要把標題折成三行 */
+.sec-head .sec-t { flex: 1 1 auto; min-width: 7em; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.sec-right { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; margin-left: auto; flex-wrap: wrap; justify-content: flex-end; }
+.sec-right .copy { padding: 5px 9px; font-size: 12px; white-space: nowrap; }
 .chev { color: var(--muted); font-size: 13px; width: 16px; text-align: center; }
 ol.list li[data-jump] { cursor: pointer; }
 ol.list li[data-jump]:active { color: var(--brand); }
