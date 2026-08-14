@@ -313,3 +313,15 @@ mark.hit { background: #ffe58a; color: #1c1c1e; border-radius: 3px; padding: 0 2
 .term-alt { display: flex; align-items: center; gap: 8px; padding: 5px 0; font-size: 15px; }
 .term-alt input { width: 18px; height: 18px; }
 .term-alt-n { color: var(--muted); font-size: 13px; }
+
+/* 逐條刪除（編輯模式）與版本切換 */
+.copy.on { background: var(--brand); color: #fff; border-color: var(--brand); }
+.item-del {
+  margin-left: 8px; background: var(--danger); color: #fff; border: none;
+  border-radius: 6px; width: 24px; height: 24px; font-size: 13px; line-height: 1;
+  vertical-align: middle; flex: 0 0 auto;
+}
+ol.list.editing li, ul.list.editing li { display: flex; align-items: flex-start; justify-content: space-between; gap: 8px; }
+ol.list.qa.editing li { display: block; }
+ol.list.qa.editing .item-del { margin-top: 6px; }
+.nt-sec-t, .nt-term, .nt-q, .nt-table-title { display: flex; align-items: center; justify-content: space-between; gap: 8px; }

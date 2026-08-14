@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v70';
+const APP_VERSION = 'v71';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -81,6 +81,68 @@ export function applyTermInNotes(notes, fix) {
     q.a = f(q.a);
   });
   return notes;
+}
+
+// ===== 加強前後的兩版切換 =====
+// 加強有時會讓某一區變差。把前一版存在 meeting.alt['kind:section']，
+// 做成「來回切換」而不是單向還原：按錯不會失去新版，可以反覆比較後再決定停在哪一版。
+const altKey = (kind, section) => `${kind}:${section}`;
+
+export function swapSectionVersion(meeting, kind, section) {
+  const alt = meeting && meeting.alt;
+  if (!alt) return false;
+  const k = altKey(kind, section);
+  if (!Array.isArray(alt[k])) return false;
+  const box = meeting[kind] || (meeting[kind] = {});
+  const cur = Array.isArray(box[section]) ? box[section] : [];
+  box[section] = alt[k];
+  alt[k] = cur;
+  return true;
+}
+
+// 兩版各有好料時：聯集去重（目前版在前），並把合併前的目前版留作備份，之後仍可切換退回
+export function mergeSectionVersions(meeting, kind, section) {
+  const alt = meeting && meeting.alt;
+  if (!alt) return false;
+  const k = altKey(kind, section);
+  if (!Array.isArray(alt[k])) return false;
+  const box = meeting[kind] || (meeting[kind] = {});
+  const cur = Array.isArray(box[section]) ? box[section] : [];
+  // 各區判斷「同一條」的欄位不同；字串就用字串本身
+  const keyOf = (x) =>
+    typeof x === 'string' ? x : String((x && (x.term || x.title || x.q || x.text)) || JSON.stringify(x));
+  const seen = new Set();
+  const out = [];
+  for (const x of cur.concat(alt[k])) {
+    const kk = keyOf(x);
+    if (!kk || seen.has(kk)) continue;
+    seen.add(kk);
+    out.push(x);
+  }
+  box[section] = out;
+  alt[k] = cur; // 合併前的版本 → 之後按切換就能退回
+  return true;
+}
+
+// 存下目前版當備份（加強前呼叫）
+export function backupSection(meeting, kind, section) {
+  const box = (meeting && meeting[kind]) || {};
+  const cur = Array.isArray(box[section]) ? box[section] : [];
+  if (!meeting.alt) meeting.alt = {};
+  meeting.alt[altKey(kind, section)] = cur.slice();
+}
+
+export function hasAltVersion(meeting, kind, section) {
+  return !!(meeting && meeting.alt && Array.isArray(meeting.alt[altKey(kind, section)]));
+}
+
+// 刪掉某一區的第 i 條（編輯模式用）
+export function removeSectionItem(meeting, kind, section, i) {
+  const box = (meeting && meeting[kind]) || {};
+  const arr = box[section];
+  if (!Array.isArray(arr) || i < 0 || i >= arr.length) return false;
+  arr.splice(i, 1);
+  return true;
 }
 
 export function bestSegIndex(text, transcript) {
@@ -1159,16 +1221,20 @@ async function renderDetail(id) {
     return fresh;
   };
 
-  const olHtml = (arr, key) =>
+  // del：編輯模式下附上刪除鈕；此時不掛 data-jump，避免點刪除誤觸「跳到出處」
+  const delBtn = (key, i) => `<button class="item-del" data-del="${key}:${i}" type="button">✕</button>`;
+  const olHtml = (arr, key, del) =>
     arr && arr.length
-      ? `<ol class="list">${arr.map((x, i) => `<li data-jump="${key}:${i}">${esc(x)}</li>`).join('')}</ol>`
+      ? `<ol class="list${del ? ' editing' : ''}">${arr
+          .map((x, i) => `<li${del ? '' : ` data-jump="${key}:${i}"`}>${esc(x)}${del ? delBtn(key, i) : ''}</li>`)
+          .join('')}</ol>`
       : `<div class="meta" style="padding-left:4px">（無）</div>`;
-  const qaHtml = (arr) =>
+  const qaHtml = (arr, del) =>
     arr && arr.length
-      ? `<ol class="list qa">${arr
+      ? `<ol class="list qa${del ? ' editing' : ''}">${arr
           .map((x, i) => {
             const { q, a } = splitQA(x);
-            return `<li data-jump="qa:${i}"><div class="qa-q"><b>問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b>答：</b>${esc(a)}</div>` : ''}</li>`;
+            return `<li${del ? '' : ` data-jump="qa:${i}"`}><div class="qa-q"><b>問：</b>${esc(q)}</div>${a ? `<div class="qa-a"><b>答：</b>${esc(a)}</div>` : ''}${del ? delBtn('qa', i) : ''}</li>`;
           })
           .join('')}</ol>`
       : `<div class="meta" style="padding-left:4px">無</div>`;
@@ -1269,12 +1335,12 @@ async function renderDetail(id) {
     { k: 'quiz', label: '✍️ 加強測驗' },
   ];
 
-  const tableHtml = (t) => {
+  const tableHtml = (t, del) => {
     const head = t.headers.map((h) => `<th>${esc(h)}</th>`).join('');
     const body = t.rows
       .map((r) => `<tr>${t.headers.map((_, i) => `<td>${esc(r[i] || '')}</td>`).join('')}</tr>`)
       .join('');
-    return `<div class="nt-table">${t.title ? `<div class="nt-table-title">${esc(t.title)}</div>` : ''}
+    return `<div class="nt-table">${t.title || del ? `<div class="nt-table-title">${esc(t.title || '')}${del || ''}</div>` : ''}
       <div class="nt-table-scroll"><table><thead><tr>${head}</tr></thead><tbody>${body}</tbody></table></div></div>`;
   };
 
@@ -1288,24 +1354,27 @@ async function renderDetail(id) {
         <button class="big" id="genNotes" data-task="notes">📚 產生學習筆記</button>
       </div>`;
     }
+    const ed = (k) => editSec === k;
     const outline = (n.outline || [])
       .map(
         (o, i) =>
-          `<div class="nt-sec" data-jump="nt:${i}"><div class="nt-sec-t">${i + 1}. ${esc(o.title)}</div>` +
+          `<div class="nt-sec"${ed('nt-o') ? '' : ` data-jump="nt:${i}"`}><div class="nt-sec-t">${i + 1}. ${esc(o.title)}${ed('nt-o') ? delBtn('nt-o', i) : ''}</div>` +
           `${(o.points || []).length ? `<ul class="list">${o.points.map((p) => `<li>${esc(p)}</li>`).join('')}</ul>` : ''}</div>`
       )
       .join('');
     const concepts = (n.concepts || [])
       .map(
-        (x) =>
-          `<div class="nt-concept"><div class="nt-term">${esc(x.term)}</div><div class="nt-plain">${esc(x.plain)}</div>` +
+        (x, i) =>
+          `<div class="nt-concept"><div class="nt-term">${esc(x.term)}${ed('nt-c') ? delBtn('nt-c', i) : ''}</div><div class="nt-plain">${esc(x.plain)}</div>` +
           `${x.why ? `<div class="nt-why">→ ${esc(x.why)}</div>` : ''}</div>`
       )
       .join('');
-    const tables = (n.tables || []).map(tableHtml).join('');
-    const figures = (n.figures || []).length ? `<ul class="list">${n.figures.map((f) => `<li>${esc(f)}</li>`).join('')}</ul>` : '';
+    const tables = (n.tables || []).map((t, i) => tableHtml(t, ed('nt-t') ? delBtn('nt-t', i) : '')).join('');
+    const figures = (n.figures || []).length
+      ? `<ul class="list${ed('nt-f') ? ' editing' : ''}">${n.figures.map((f, i) => `<li>${esc(f)}${ed('nt-f') ? delBtn('nt-f', i) : ''}</li>`).join('')}</ul>`
+      : '';
     const quiz = (n.quiz || [])
-      .map((x, i) => `<div class="nt-quiz"><div class="nt-q">Q${i + 1}. ${esc(x.q)}</div><div class="nt-a">${esc(x.a)}</div></div>`)
+      .map((x, i) => `<div class="nt-quiz"><div class="nt-q">Q${i + 1}. ${esc(x.q)}${ed('nt-q') ? delBtn('nt-q', i) : ''}</div><div class="nt-a">${esc(x.a)}</div></div>`)
       .join('');
     const none = '<div class="meta" style="padding-left:4px">（無）</div>';
     return `<div class="card mode-pane">
@@ -1323,6 +1392,8 @@ async function renderDetail(id) {
         <button class="copy" id="regenNotes" style="margin-left:6px">重新產生</button></div>
     </div>`;
   };
+
+  let editSec = null; // 目前處於編輯模式的區塊代碼（一次只開一區）
 
   const drawBody = (l) => {
     const c = contentFor(l);
@@ -1382,18 +1453,33 @@ async function renderDetail(id) {
       if (ch) ch.textContent = v ? '▸' : '▾';
     };
     const coll = getColl();
-    const secHead = (k, title, copyKey, extra) =>
-      `<div class="section-title sec-head" data-sec="${k}"${extra ? ` style="${extra}"` : ''}><span class="sec-t">${title}</span><span class="sec-right"><button class="copy" data-copy="${copyKey}">複製</button><span class="chev">${coll[k] ? '▸' : '▾'}</span></span></div>`;
+    // 區塊代碼 → 實際的資料位置，供「兩版切換／合併／編輯」使用
+    const SEC_SRC = {
+      ai: ['summary', 'actionItems'], mp: ['summary', 'mainPoints'], qa: ['summary', 'qa'],
+      'nt-o': ['notes', 'outline'], 'nt-c': ['notes', 'concepts'], 'nt-t': ['notes', 'tables'],
+      'nt-f': ['notes', 'figures'], 'nt-q': ['notes', 'quiz'],
+    };
+    const secHead = (k, title, copyKey, extra) => {
+      const src = SEC_SRC[k];
+      // 只有原文檢視可以編輯／切換版本（譯本是衍生資料，改了會被下次翻譯蓋掉）
+      const editable = src && isOrig;
+      const hasAlt = editable && hasAltVersion(m, src[0], src[1]);
+      const inEdit = editable && editSec === k;
+      const tools =
+        (hasAlt ? `<button class="copy" data-swap="${k}">↩ 換版</button><button class="copy" data-mergev="${k}">⊕ 合併</button>` : '') +
+        (editable ? `<button class="copy${inEdit ? ' on' : ''}" data-edit="${k}">${inEdit ? '完成' : '✏️ 編輯'}</button>` : '');
+      return `<div class="section-title sec-head" data-sec="${k}"${extra ? ` style="${extra}"` : ''}><span class="sec-t">${title}</span><span class="sec-right">${tools}<button class="copy" data-copy="${copyKey}">複製</button><span class="chev">${coll[k] ? '▸' : '▾'}</span></span></div>`;
+    };
 
     // 會議摘要三區 vs 學習筆記五區：只有這張卡片隨模式切換，逐字稿以下兩模式共用
     const meetingCard = `
       <div class="card mode-pane">
         ${secHead('ai', '✅ 待辦事項 Action Item', 'ai', 'margin-top:0')}
-        <div class="sec-body" data-secbody="ai"${coll.ai ? ' hidden' : ''}>${olHtml(actionItems, 'ai')}</div>
+        <div class="sec-body" data-secbody="ai"${coll.ai ? ' hidden' : ''}>${olHtml(actionItems, 'ai', editSec === 'ai')}</div>
         ${secHead('mp', '📌 會議重點 Main Point', 'mp')}
-        <div class="sec-body" data-secbody="mp"${coll.mp ? ' hidden' : ''}>${olHtml(mainPoints, 'mp')}</div>
+        <div class="sec-body" data-secbody="mp"${coll.mp ? ' hidden' : ''}>${olHtml(mainPoints, 'mp', editSec === 'mp')}</div>
         ${secHead('qa', '❓ 會議提問 Q&amp;A', 'qa')}
-        <div class="sec-body" data-secbody="qa"${coll.qa ? ' hidden' : ''}>${qaHtml(qa)}</div>
+        <div class="sec-body" data-secbody="qa"${coll.qa ? ' hidden' : ''}>${qaHtml(qa, editSec === 'qa')}</div>
         <div class="hint" style="margin-top:10px">點各區標題可摺疊／展開；<b>點任一條內容</b>可跳到它在逐字稿中的出處</div>
       </div>`;
 
@@ -1482,6 +1568,36 @@ async function renderDetail(id) {
         } catch (_) {
           alert('複製失敗，請手動選取');
         }
+      };
+    });
+
+    // 兩版切換／合併／編輯模式／刪除
+    bodyEl.querySelectorAll('[data-swap],[data-mergev],[data-edit],[data-del]').forEach((b) => {
+      b.onclick = async (e) => {
+        e.stopPropagation(); // 別觸發到區塊標題的摺疊
+        const k = b.dataset.swap || b.dataset.mergev || b.dataset.edit;
+        if (b.dataset.edit) {
+          editSec = editSec === k ? null : k;
+          drawBody(lang);
+          return;
+        }
+        if (b.dataset.del) {
+          const [sec, iStr] = b.dataset.del.split(':');
+          const src = SEC_SRC[sec];
+          if (!src) return;
+          await persist((fresh) => removeSectionItem(fresh, src[0], src[1], +iStr), { edit: true });
+          drawBody(lang);
+          return;
+        }
+        const src = SEC_SRC[k];
+        if (!src) return;
+        const merge = !!b.dataset.mergev;
+        await persist((fresh) => {
+          if (merge) mergeSectionVersions(fresh, src[0], src[1]);
+          else swapSectionVersion(fresh, src[0], src[1]);
+        }, { edit: true });
+        drawBody(lang);
+        toast(merge ? '已合併兩版（重複的已去除）' : '已換版');
       };
     });
 
@@ -1848,6 +1964,7 @@ async function renderDetail(id) {
       );
       await persist((fresh) => {
         fresh.summary = fresh.summary || {};
+        backupSection(fresh, 'summary', section); // 留下加強前的版本，之後可來回切換
         fresh.summary[section] = items;
         fresh.translations = {}; // 內容改了 → 清掉舊翻譯
       }, { edit: true });
@@ -2025,6 +2142,7 @@ async function renderDetail(id) {
       );
       await persist((fresh) => {
         fresh.notes = fresh.notes || { outline: [], concepts: [], tables: [], figures: [], quiz: [] };
+        backupSection(fresh, 'notes', section); // 留下加強前的版本，之後可來回切換
         fresh.notes[section] = items;
         fresh.translations = {}; // 內容改了 → 清掉舊翻譯
       }, { edit: true });

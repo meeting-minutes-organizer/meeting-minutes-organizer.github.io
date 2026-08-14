@@ -101,6 +101,9 @@ export function mergeMeeting(a, b) {
   // 但只有一邊有的時候一定要留住，否則剛產生好的筆記會被沒有筆記的另一邊蓋掉。
   const notes = base.notes || other.notes;
   if (notes) merged.notes = notes;
+  // 加強前的備份版：同 notes 的道理，只有一邊有時一定要留，否則同步一次就沒得換回去
+  const alt = base.alt || other.alt;
+  if (alt) merged.alt = alt;
   if (editStamp(a) === editStamp(b)) {
     // 同一逐字稿版本 → 兩邊翻譯互補（base 優先）
     merged.translations = { ...(other.translations || {}), ...(base.translations || {}) };
