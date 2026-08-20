@@ -50,20 +50,52 @@ function downsample(data, srcRate, dstRate) {
   return out;
 }
 
-export async function splitAudioToChunks(file, chunkSec, onProgress) {
+// 用指定取樣率的 AudioContext 解碼。rate 傳 0 代表用瀏覽器預設取樣率。
+// 注意：decodeAudioData 會「吃掉」傳進去的 ArrayBuffer（detach），
+// 所以每次嘗試都必須從 File 重新讀一份，不能重用同一個 buffer。
+async function decodeWithRate(file, rate) {
   const AC = window.AudioContext || window.webkitAudioContext;
-  if (!AC) throw new Error('瀏覽器不支援音訊切割');
-  const arrayBuf = await file.arrayBuffer();
   let ctx;
   try {
-    ctx = new AC({ sampleRate: TARGET_SR });
+    ctx = rate ? new AC({ sampleRate: rate }) : new AC();
   } catch (_) {
     ctx = new AC();
   }
-  const audioBuf = await ctx.decodeAudioData(arrayBuf);
   try {
-    ctx.close();
-  } catch (_) {}
+    return await ctx.decodeAudioData(await file.arrayBuffer());
+  } finally {
+    try {
+      ctx.close();
+    } catch (_) {}
+  }
+}
+
+function describeErr(e) {
+  if (!e) return '未回報原因';
+  return `${e.name || 'Error'}: ${e.message || String(e)}`;
+}
+
+export async function splitAudioToChunks(file, chunkSec, onProgress) {
+  const AC = window.AudioContext || window.webkitAudioContext;
+  if (!AC) throw new Error('瀏覽器不支援音訊切割');
+  let audioBuf = null;
+  let firstErr = null;
+  try {
+    audioBuf = await decodeWithRate(file, TARGET_SR);
+  } catch (e) {
+    firstErr = e;
+  }
+  if (!audioBuf) {
+    // 指定 16kHz 時，瀏覽器要在解碼的同時重新取樣，走的是另一段程式；
+    // 有些檔案在這條路上會失敗，改用預設取樣率反而解得開（之後再由 downsample 降到 16k）。
+    try {
+      audioBuf = await decodeWithRate(file, 0);
+    } catch (e) {
+      const err = new Error(`16kHz → ${describeErr(firstErr)}；預設取樣率 → ${describeErr(e)}`);
+      err.name = 'DecodeFailed';
+      throw err;
+    }
+  }
 
   const srcRate = audioBuf.sampleRate;
   const mono = downsample(audioBuf.getChannelData(0), srcRate, TARGET_SR);

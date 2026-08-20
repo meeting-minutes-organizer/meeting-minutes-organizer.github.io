@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v77';
+const APP_VERSION = 'v78';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -915,6 +915,10 @@ async function processJob(job) {
           const reason = splitErr
             ? `${splitErr.name || 'Error'}: ${splitErr.message || String(splitErr)}`
             : '瀏覽器未回報原因';
+          const f = job._file;
+          const fileInfo = f
+            ? `${f.name || '未命名'}／${f.type || '格式不明'}／${(f.size / 1048576).toFixed(1)}MB`
+            : '檔案資訊不明';
           throw new Error(
             `這段錄音約 ${mins} 分鐘，瀏覽器切割音檔失敗，無法分段送出。
 ` +
@@ -922,7 +926,9 @@ async function processJob(job) {
 ` +
             `（技術原因：無法切割時只能整檔送出，${mins} 分鐘每次請求約 ${Math.round((job.durationSec || 0) * 32 / 1000)}k token，免費層額度吃不下。）
 ` +
-            `切割失敗的原因：${reason}`
+            `切割失敗的原因：${reason}
+` +
+            `檔案：${fileInfo}`
           );
         } else {
           // 後備：整檔上傳 + 時間範圍提示（每把金鑰各一份）
