@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries } from './gemini.js';
 import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v75';
+const APP_VERSION = 'v76';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -825,7 +825,7 @@ async function topUpMissingKeys(job, ui) {
         const missing = missingKeyEntries(c.uploads, entries);
         if (!missing.length || !job._files[i]) continue;
         ui.setLabel(`補傳第 ${i + 1} 支給 ${missing.map((k) => k.name || '金鑰').join('、')}…`);
-        const r = await uploadBlobToKeys(job._files[i], missing, ui.onProgress);
+        const r = await uploadBlobToKeys(job._files[i], missing, ui.onProgress, { exact: true });
         c.uploads = c.uploads.concat(r.uploads);
       }
     } else if (job.mode === 'whole' && job._file) {
@@ -834,7 +834,7 @@ async function topUpMissingKeys(job, ui) {
       const missing = missingKeyEntries(first.uploads, entries);
       if (!missing.length) return;
       ui.setLabel(`補傳音檔給 ${missing.map((k) => k.name || '金鑰').join('、')}…`);
-      const r = await uploadBlobToKeys(job._file, missing, ui.onProgress);
+      const r = await uploadBlobToKeys(job._file, missing, ui.onProgress, { exact: true });
       job.chunks.forEach((c) => {
         if (!c.segments) c.uploads = (c.uploads || []).concat(r.uploads);
       });
@@ -884,13 +884,15 @@ async function processJob(job) {
         if (!job._file) throw new Error('原始音檔已不在，請按「新增會議」重新選擇檔案。');
         // 嘗試把單一音檔切成小段（每段 30 分鐘），大幅降低每次請求 token
         let blobs = null;
+        let splitErr = null;
         try {
           ui.setLabel('切割音檔中…');
           const r = await splitAudioToChunks(job._file, 30 * 60, (i, n) => ui.setLabel(`切割音檔中…（${i}/${n} 段）`));
           blobs = r.chunks;
           job.durationSec = r.durationSec || job.durationSec;
-        } catch (_) {
-          blobs = null; // 解碼失敗 → 改用整檔模式
+        } catch (e) {
+          blobs = null;
+          splitErr = e; // 記下原因；長錄音切不動時要據此給出可執行的建議
         }
         if (blobs && blobs.length) {
           job.mode = 'split';
@@ -903,6 +905,17 @@ async function processJob(job) {
             job.chunks[i].mime = r.mime;
             blobs[i].blob = null; // 釋放記憶體
           }
+        } else if (!canUseWholeMode(job.durationSec)) {
+          // 切割失敗且錄音很長：整檔模式每次請求都要送完整音檔，免費層必定卡在 429 跑不完。
+          // 與其進入一個贏不了的重試迴圈，不如直接講清楚該怎麼做。
+          const mins = Math.round((job.durationSec || 0) / 60);
+          throw new Error(
+            `這段錄音約 ${mins} 分鐘，手機記憶體不足以在瀏覽器內切割（解碼一小時約需 220MB，三小時要 1GB 以上）。
+` +
+            `請把錄音分成 2～4 段（每段建議 1 小時內），在「新增會議」一次選取多支檔案，App 會依檔名順序自動接成一份逐字稿。
+` +
+            `（技術原因：無法切割時只能整檔送出，${mins} 分鐘每次請求約 ${Math.round((job.durationSec || 0) * 32 / 1000)}k token，免費層額度吃不下。）`
+          );
         } else {
           // 後備：整檔上傳 + 時間範圍提示（每把金鑰各一份）
           job.mode = 'whole';
@@ -1021,10 +1034,25 @@ function paintJobShell() {
           : '<div class="warn" style="margin-top:8px">⚠️ 這台裝置不支援自動恆亮。螢幕變暗會中斷辨識，請先到<b>設定 → 螢幕顯示與亮度 → 自動鎖定</b>改成<b>永不</b>，或期間偶爾點一下螢幕。</div>'
       }
       <div class="progress" id="jobprog"></div>
+      <div class="hint" id="jobkeys" style="margin-top:8px"></div>
       <button class="big danger" id="stopJob" style="margin-top:14px">■ 停止辨識</button>
       <div class="hint" style="margin-top:6px">停止後已完成的段落會保留，之後可從中斷處繼續。</div>
     </div>`;
   paintJob();
+  // 本場實際能輪替的金鑰：音檔綁專案，只有「這場開始前就上傳過」的金鑰才用得到。
+  // 中途新增的金鑰不會生效——不講清楚的話，使用者會以為某把金鑰壞了。
+  const job = jobState && jobState.job;
+  const upKeys = job && job.chunks && job.chunks[0] && job.chunks[0].uploads;
+  const kEl = document.getElementById('jobkeys');
+  if (kEl && upKeys && upKeys.length) {
+    const total = getApiKeyEntries().length;
+    const names = upKeys.map((u) => u.name || '未命名').join('、');
+    kEl.innerHTML =
+      `🔑 本場可輪替：<b>${esc(names)}</b>（${upKeys.length} 把）` +
+      (total > upKeys.length
+        ? `　<span style="color:var(--muted)">其餘 ${total - upKeys.length} 把沒有這場的音檔，本場不會用到；下一場才會納入。</span>`
+        : '');
+  }
   const sb = document.getElementById('stopJob');
   if (sb) sb.onclick = stopRunningJob;
 }

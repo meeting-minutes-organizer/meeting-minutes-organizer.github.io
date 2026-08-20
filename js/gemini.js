@@ -502,6 +502,31 @@ function toKeyObjs(keys) {
     .filter((o) => o.key);
 }
 
+// 音檔要上傳到「每一把金鑰的專案」才能輪替（Gemini 的檔案綁專案）。
+// 但金鑰越多，上傳量就線性暴增：5 把 × 110 分鐘（4 段 × 55MB）= 1.1GB，手機根本傳不完。
+// 因此設上限：只挑幾把上傳。挑選依據是「今日用得少、且沒在冷卻」的優先。
+export const MAX_UPLOAD_KEYS = 3;
+export function pickUploadKeys(kos, max = MAX_UPLOAD_KEYS) {
+  const list = toKeyObjs(kos);
+  if (list.length <= max) return list;
+  return list
+    .map((k, i) => {
+      const st = k.key ? getKeyStatus(k.key) : { count: 0, cooling: 0 };
+      return { k, i, cooling: st.cooling, count: st.count };
+    })
+    .sort((a, b) => (a.cooling !== b.cooling ? a.cooling - b.cooling : a.count !== b.count ? a.count - b.count : a.i - b.i))
+    .slice(0, max)
+    .map((x) => x.k);
+}
+
+// 整檔模式：每一次請求都要把「完整音檔」送出去。錄音只要超過一個時間窗，
+// 就會被重複送好幾次（180 分鐘 = 每次 34.5 萬 token × 5 次），免費層必定卡死。
+// 所以長錄音在無法切割時要明確失敗，而不是進入一個贏不了的重試迴圈。
+export function canUseWholeMode(durationSec) {
+  if (!durationSec) return true; // 長度未知 → 保守允許，不要擋掉本來能跑的短檔
+  return durationSec <= WINDOW_SEC;
+}
+
 // 單把金鑰的上傳（含暫時性失敗重試）。
 // 沒有重試時，一次 429／5xx／網路瞬斷就會讓這把金鑰被踢出整場任務的輪替名單，
 // 之後辨識撞到額度上限只能乾等——這正是「有兩把金鑰卻不會切換」的根因。
@@ -559,10 +584,11 @@ export function missingKeyEntries(uploads, apiKeys) {
 // 把音檔上傳到「每一把金鑰的專案」，回傳 { model, mime, uploads:[{key,name,fileUri}] }
 // 這樣之後辨識輪替金鑰時，每把用自己的檔案，不會 403。
 export async function uploadForJob(file, apiKeys, onProgress) {
-  const kos = toKeyObjs(apiKeys);
-  if (!kos.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
+  const all = toKeyObjs(apiKeys);
+  if (!all.length) throw new Error('尚未設定 API 金鑰，請先到設定填入。');
   report(onProgress, 'model', 3, '選擇辨識型號中…');
-  const model = await resolveModel(kos.map((k) => k.key));
+  const model = await resolveModel(all.map((k) => k.key));
+  const kos = pickUploadKeys(all); // 金鑰太多時只挑幾把，避免上傳量暴增
   const { uploads, mime, lastErr } = await uploadToKeys(file, kos, onProgress, true);
   if (!uploads.length) throw lastErr || new Error('音檔上傳失敗（所有金鑰皆無法使用）');
   return { model, mime, uploads };
@@ -580,9 +606,11 @@ export async function pickModelForKeys(apiKeys, opts = {}) {
   return resolveModel(kos.map((k) => k.key), opts);
 }
 // 把一個音檔（Blob/File）上傳到每一把金鑰的專案，回傳 { uploads:[{key,name,fileUri}], mime }
-export async function uploadBlobToKeys(blob, apiKeys, onProgress) {
-  const kos = toKeyObjs(apiKeys);
-  if (!kos.length) throw new Error('尚未設定 API 金鑰');
+export async function uploadBlobToKeys(blob, apiKeys, onProgress, opts = {}) {
+  const all = toKeyObjs(apiKeys);
+  if (!all.length) throw new Error('尚未設定 API 金鑰');
+  // opts.exact=true 表示呼叫端已經指定好要傳哪幾把（例如補傳缺席金鑰），不要再挑
+  const kos = opts.exact ? all : pickUploadKeys(all);
   const { uploads, mime, lastErr } = await uploadToKeys(blob, kos, onProgress, false);
   if (!uploads.length) throw lastErr || new Error('音檔上傳失敗（所有金鑰皆無法使用）');
   return { uploads, mime };
