@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v74';
+const APP_VERSION = 'v75';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -2269,7 +2269,18 @@ function renderSettings() {
     </div>
     <div class="card">
       <p style="margin-top:0"><b>☁️ GitHub 雲端同步（跨裝置記憶）</b>
-        <span class="meta">${enabled ? '｜狀態：已開啟' : '｜狀態：未開啟（只存本機）'}</span></p>
+        <span class="meta">${
+          !enabled
+            ? '｜狀態：未開啟（只存本機）'
+            : sync.isTokenInvalid()
+              ? '｜<b style="color:var(--danger)">狀態：權杖失效，請更新</b>'
+              : '｜狀態：已開啟'
+        }</span></p>
+      ${
+        enabled && sync.isTokenInvalid()
+          ? `<div class="warn" style="margin-bottom:10px">${esc(sync.TOKEN_401_MSG)}</div>`
+          : ''
+      }
       <input type="password" id="ghToken" placeholder="貼上你的 GitHub 權杖（token）" value="${esc(cfg.token || '')}" autocomplete="off" />
       <input type="text" id="ghRepo" placeholder="你的帳號/你的資料庫repo（例：myname/my-notes-data）" value="${cfg.owner && cfg.repo ? esc(cfg.owner + '/' + cfg.repo) : ''}" style="margin-top:8px" />
       <button class="big" id="saveSync">儲存並同步</button>
@@ -2278,7 +2289,7 @@ function renderSettings() {
       <div class="hint">
         <b>不填也能用</b>（記錄只存這支手機）。要跨裝置才需要設定，全部用<b>你自己的</b> GitHub：<br>
         1. 在 GitHub 建一個<b>私人 repo</b>（例如 <code>my-notes-data</code>），把「你的帳號/repo名」填在上面欄位。<br>
-        2. 到 <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained tokens</a> → Repository access 選那個 repo → Permissions 的 <b>Contents</b> 設 <b>Read and write</b> → 產生後貼到上面。<br>
+        2. 到 <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">GitHub → Fine-grained tokens</a> → Repository access 選那個 repo → Permissions 的 <b>Contents</b> 設 <b>Read and write</b> → 產生後貼到上面。<b>Expiration 建議設一年</b>，否則到期後同步會突然停止。<br>
         權杖與記錄都只存你自己的裝置與你自己的 repo。
       </div>
     </div>

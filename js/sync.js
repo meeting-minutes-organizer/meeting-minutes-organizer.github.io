@@ -6,6 +6,27 @@
 
 const CFG_KEY = 'gh_sync_config';
 
+// 權杖失效狀態：401 之後記起來，讓設定頁能顯示「權杖失效」而不是「已開啟」。
+// （GitHub 有回傳權杖到期日的標頭，但它不在 CORS 白名單裡，瀏覽器讀不到，
+//   所以無法事先預警，只能在失效當下講清楚該怎麼處理。）
+const TOKEN_BAD_KEY = 'gh_token_invalid';
+export const TOKEN_401_MSG =
+  'GitHub 權杖已失效或過期。到 GitHub → Settings → Developer settings → Fine-grained tokens，' +
+  '把那把權杖 Regenerate（或重建一把，Contents 權限設 Read and write、有效期拉長），再貼回這裡儲存。你的記錄都還在，不會遺失。';
+export function markTokenInvalid(v) {
+  try {
+    if (v) localStorage.setItem(TOKEN_BAD_KEY, '1');
+    else localStorage.removeItem(TOKEN_BAD_KEY);
+  } catch (_) {}
+}
+export function isTokenInvalid() {
+  try {
+    return localStorage.getItem(TOKEN_BAD_KEY) === '1';
+  } catch (_) {
+    return false;
+  }
+}
+
 export function getSyncConfig() {
   try {
     return JSON.parse(localStorage.getItem(CFG_KEY)) || null;
@@ -191,8 +212,12 @@ export async function pull() {
   // cache:'no-store'：同步一定要讀到最新狀態，且下面的 raw 重抓絕不能命中這次的快取（見該處說明）
   const res = await fetch(apiUrl(c), { headers: authHeaders(c), cache: 'no-store' });
   if (res.status === 404) return { doc: { meetings: [], deleted: [], deletedAt: {}, groups: [], groupsDeleted: [], groupsDeletedAt: {} }, sha: null };
-  if (res.status === 401) throw new Error('GitHub 權杖無效或已過期');
+  if (res.status === 401) {
+    markTokenInvalid(true);
+    throw new Error(TOKEN_401_MSG);
+  }
   if (!res.ok) throw new Error(`雲端讀取失敗 (${res.status})`);
+  markTokenInvalid(false); // 這次通過了 → 清掉先前的失效標記
   const data = await res.json();
 
   // 取得檔案原始文字內容。
@@ -264,7 +289,10 @@ export async function push(doc, sha) {
   if (sha) body.sha = sha;
   const res = await fetch(apiUrl(c), { method: 'PUT', headers: authHeaders(c), body: JSON.stringify(body) });
   if (res.status === 409) throw new Error('CONFLICT');
-  if (res.status === 401) throw new Error('GitHub 權杖無效或已過期');
+  if (res.status === 401) {
+    markTokenInvalid(true);
+    throw new Error(TOKEN_401_MSG);
+  }
   if (!res.ok) throw new Error(`雲端寫入失敗 (${res.status})`);
   return res.json();
 }
