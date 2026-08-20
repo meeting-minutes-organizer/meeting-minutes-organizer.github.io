@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v76';
+const APP_VERSION = 'v77';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -893,6 +893,9 @@ async function processJob(job) {
         } catch (e) {
           blobs = null;
           splitErr = e; // 記下原因；長錄音切不動時要據此給出可執行的建議
+          try {
+            console.error('[split] 切割音檔失敗', e);
+          } catch (_) {}
         }
         if (blobs && blobs.length) {
           job.mode = 'split';
@@ -909,12 +912,17 @@ async function processJob(job) {
           // 切割失敗且錄音很長：整檔模式每次請求都要送完整音檔，免費層必定卡在 429 跑不完。
           // 與其進入一個贏不了的重試迴圈，不如直接講清楚該怎麼做。
           const mins = Math.round((job.durationSec || 0) / 60);
+          const reason = splitErr
+            ? `${splitErr.name || 'Error'}: ${splitErr.message || String(splitErr)}`
+            : '瀏覽器未回報原因';
           throw new Error(
-            `這段錄音約 ${mins} 分鐘，手機記憶體不足以在瀏覽器內切割（解碼一小時約需 220MB，三小時要 1GB 以上）。
+            `這段錄音約 ${mins} 分鐘，瀏覽器切割音檔失敗，無法分段送出。
 ` +
             `請把錄音分成 2～4 段（每段建議 1 小時內），在「新增會議」一次選取多支檔案，App 會依檔名順序自動接成一份逐字稿。
 ` +
-            `（技術原因：無法切割時只能整檔送出，${mins} 分鐘每次請求約 ${Math.round((job.durationSec || 0) * 32 / 1000)}k token，免費層額度吃不下。）`
+            `（技術原因：無法切割時只能整檔送出，${mins} 分鐘每次請求約 ${Math.round((job.durationSec || 0) * 32 / 1000)}k token，免費層額度吃不下。）
+` +
+            `切割失敗的原因：${reason}`
           );
         } else {
           // 後備：整檔上傳 + 時間範圍提示（每把金鑰各一份）
