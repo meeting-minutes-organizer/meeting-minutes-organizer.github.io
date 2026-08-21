@@ -249,6 +249,12 @@ function orderVariants(vs) {
 async function postJsonRotating(variants, makeReq, onProgress, label) {
   // 錯誤訊息用當前動作命名（摘要/翻譯/問答/加強/辨識），不再一律寫「辨識失敗」誤導
   const act = (label || '處理').replace(/[…\.]+$/, '').replace(/中$/, '') || '處理';
+  // 重試訊息會蓋掉原本的「辨識第 2/3 段…」，使用者就看不出跑到哪、是不是做了一半。
+  // 把段號抽出來，重試與等待時都掛在前面。
+  const partTag = (() => {
+    const m = (label || '').match(/第\s*\d+\s*\/\s*\d+\s*[段支]/);
+    return m ? `${m[0]} · ` : '';
+  })();
   const vs = orderVariants(variants && variants.length ? variants : [{}]);
   const MAX_ROUNDS = 4;
   const MAX_TOTAL_WAIT = 150000; // 累計等待超過 ~2.5 分鐘就放棄（避免無限迴圈）
@@ -264,7 +270,13 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       const v = vs[vi % vs.length];
       vi++;
       const multi = vs.length > 1;
-      report(onProgress, 'transcribe', null, round === 0 && k === 0 ? label : multi ? '切換金鑰重試中…' : `重試中…（第 ${round} 次）`, v.name);
+      report(
+        onProgress,
+        'transcribe',
+        null,
+        round === 0 && k === 0 ? label : multi ? `${partTag}切換金鑰重試中…` : `${partTag}重試中…（第 ${round} 次）`,
+        v.name
+      );
       const { url, body: rawBody } = makeReq(v);
       // 若本階段已知模型拒絕 thinkingBudget:0，主動移除該參數再送
       let body = rawBody;
@@ -341,7 +353,7 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
     const wait = Math.min(35000, retryMs || 8000 * (round + 1));
     if (totalWait + wait > MAX_TOTAL_WAIT) break;
     totalWait += wait;
-    report(onProgress, 'transcribe', null, `${vs.length > 1 ? '所有金鑰' : '額度'}暫時受限，等待 ${Math.round(wait / 1000)} 秒後再試…`);
+    report(onProgress, 'transcribe', null, `${partTag}${vs.length > 1 ? '所有金鑰' : '額度'}暫時受限，等待 ${Math.round(wait / 1000)} 秒後再試…`);
     await sleep(wait);
     throwIfAborted();
   }
