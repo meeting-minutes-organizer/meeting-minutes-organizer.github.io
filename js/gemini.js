@@ -439,8 +439,17 @@ async function transcribeWindow(uploads, mime, model, start, end, whole, onProgr
       segments = null;
     }
   }
-  // 內容太密被截斷 → 對半再切（有時間範圍時才能切）
-  if ((truncated || segments === null) && !whole && depth < 4 && end - start > 120) {
+  // 內容太密被截斷 / 回應解析不出來 → 對半再問一次
+  if ((truncated || segments === null) && depth < 4 && end - start > 120) {
+    if (whole) {
+      // 切段模式：上傳的就是「這一段」的音檔，時間從 0 開始算。
+      // 原本這條路完全沒有補救，一次失敗整段就報廢；改成在這個檔案內對半再問。
+      const dur = end - start;
+      const mid = Math.floor(dur / 2);
+      const a = await transcribeWindow(uploads, mime, model, 0, mid, false, onProgress, label, depth + 1, hintSpeakers);
+      const b = await transcribeWindow(uploads, mime, model, mid, dur, false, onProgress, label, depth + 1, hintSpeakers);
+      return a.concat(b);
+    }
     const mid = Math.floor((start + end) / 2);
     const a = await transcribeWindow(uploads, mime, model, start, mid, false, onProgress, label, depth + 1, hintSpeakers);
     const b = await transcribeWindow(uploads, mime, model, mid, end, false, onProgress, label, depth + 1, hintSpeakers);
@@ -448,7 +457,14 @@ async function transcribeWindow(uploads, mime, model, start, end, whole, onProgr
   }
   if (segments === null) {
     if (truncated) throw new Error('這段錄音內容太密集，無法完整辨識，請重試一次。');
-    throw new Error('辨識結果解析失敗，請重試一次。');
+    // 把模型實際回了什麼帶出來。只寫「解析失敗」等於把唯一的線索丟掉，
+    // 下次再發生還是只能猜（安全阻擋、空回應、格式跑掉是完全不同的問題）。
+    const reason =
+      (cand && cand.finishReason) ||
+      (data && data.promptFeedback && data.promptFeedback.blockReason) ||
+      '未回報';
+    const peek = text ? `回應開頭：${String(text).slice(0, 120)}` : '這次回應沒有任何文字內容。';
+    throw new Error(`辨識結果解析失敗，請重試一次。（finishReason: ${reason}）${peek}`);
   }
   return segments;
 }
