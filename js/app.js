@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded } from './gemini.js';
 import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v83';
+const APP_VERSION = 'v84';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -977,7 +977,22 @@ async function processJob(job) {
       if (n > 1) label = job.mode === 'multi' ? `辨識第 ${i + 1}/${n} 支…` : `辨識第 ${i + 1}/${n} 段（${mmssApp(c.start)}–${mmssApp(c.end)}）…`;
       const whole = job.mode === 'whole' ? !!c.whole : true;
       const seen = collectSeen();
-      c.segments = await transcribeRange(c.uploads, c.mime || job.mime, job.model, c.start || 0, c.end || 0, whole, ui.onProgress, label, seen.length ? seen : null);
+      const run = () =>
+        transcribeRange(c.uploads, c.mime || job.mime, job.model, c.start || 0, c.end || 0, whole, ui.onProgress, label, seen.length ? seen : null);
+      try {
+        c.segments = await run();
+      } catch (e) {
+        // 型號忙線（503）換金鑰救不了——每把金鑰打的都是同一個型號。
+        // 改用排名中的下一個型號，整場沿用，不要每段都重踩一次。
+        if (isAborted() || !isModelOverloaded(e)) throw e;
+        const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
+        if (!alt) throw e;
+        ui.setLabel(`${job.model} 忙線中，改用 ${alt} 重試…`);
+        job.model = alt;
+        await persistJob(job);
+        paintJob();
+        c.segments = await run();
+      }
       ui.stopEase();
       await persistJob(job);
       ui.setBar(next);

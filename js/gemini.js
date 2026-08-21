@@ -49,7 +49,9 @@ function isAbortError(e) {
 
 // 動態挑選型號：向 API 詢問目前可用的模型，挑最適合的。
 // 這樣 Google 汰換型號名稱（如 2.5-flash → 3.5-flash）時 App 不會壞。
-export function pickModel(models, opts = {}) {
+// 依偏好把可用型號排名（分數高的在前）。取第一名用 pickModel()，
+// 需要在首選忙線時退而求其次，就用整份排名。
+export function rankModels(models, opts = {}) {
   const lite = opts.preferLite != null ? opts.preferLite : preferLite;
   const bad = /embedding|aqa|imagen|image|veo|tts|audio-native|gemma|learnlm|robotics|computer-use|live/i;
   const scored = (models || [])
@@ -76,13 +78,21 @@ export function pickModel(models, opts = {}) {
     })
     .filter(Boolean)
     .sort((a, b) => b.score - a.score);
-  return scored.length ? scored[0].name : null;
+  return scored.map((x) => x.name);
+}
+
+// 只要最佳的那一個（絕大多數地方用這個）
+export function pickModel(models, opts = {}) {
+  const list = rankModels(models, opts);
+  return list.length ? list[0] : null;
 }
 
 // 查型號結果快取（依 preferLite 分開），避免每次都打 ListModels、也避免單把金鑰冷卻就整個失敗
 const modelCache = {};
+const modelListCache = {};
 export function clearModelCache() {
   for (const k in modelCache) delete modelCache[k];
+  for (const k in modelListCache) delete modelListCache[k];
 }
 // apiKeys 可為單把字串或多把陣列 → 多把時逐把嘗試查型號（某把冷卻/失敗會換下一把）
 // opts.preferLite: 明確指定要不要用 Flash-Lite（辨識用全域設定；摘要/翻譯固定 false 品質優先）
@@ -107,8 +117,10 @@ async function resolveModel(apiKeys, opts = {}) {
       continue;
     }
     const data = await res.json();
-    const name = pickModel(data.models || [], { preferLite: lite });
+    const ranked = rankModels(data.models || [], { preferLite: lite });
+    const name = ranked.length ? ranked[0] : null;
     if (name) {
+      modelListCache[ck] = ranked;
       modelCache[ck] = name;
       return name;
     }
@@ -645,6 +657,31 @@ export async function pickModelForKeys(apiKeys, opts = {}) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) throw new Error('尚未設定 API 金鑰');
   return resolveModel(kos.map((k) => k.key), opts);
+}
+
+// 首選型號忙線（503 高負載）時要換一個。回傳排名中的下一個，沒有就 null。
+export async function nextModelForKeys(apiKeys, current, opts = {}) {
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) return null;
+  const lite = opts.preferLite != null ? opts.preferLite : preferLite;
+  const ck = String(lite);
+  if (!modelListCache[ck]) {
+    try {
+      await resolveModel(kos.map((k) => k.key), opts);
+    } catch (_) {
+      return null;
+    }
+  }
+  const list = modelListCache[ck] || [];
+  const i = list.indexOf(current);
+  return i >= 0 && i + 1 < list.length ? list[i + 1] : null;
+}
+
+// 503／UNAVAILABLE：這是「這個型號現在忙不過來」，不是金鑰或音檔的問題。
+// 換金鑰沒有用——每把金鑰打的都是同一個型號。
+export function isModelOverloaded(e) {
+  const m = (e && e.message) || '';
+  return /\(503\)|UNAVAILABLE|high demand|overloaded/i.test(m);
 }
 // 把一個音檔（Blob/File）上傳到每一把金鑰的專案，回傳 { uploads:[{key,name,fileUri}], mime }
 export async function uploadBlobToKeys(blob, apiKeys, onProgress, opts = {}) {
