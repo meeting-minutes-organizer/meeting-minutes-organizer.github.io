@@ -123,6 +123,20 @@ function report(onProgress, phase, pct, message, keyName) {
   if (onProgress) onProgress({ phase, pct, message, keyName });
 }
 
+// 從回應中取出模型真正的答案。
+//
+// 思考型模型（gemini 3.x 起是預設）回傳的 parts 不只一段：可能夾帶「思考摘要」
+// （帶 thought: true），也可能把長答案拆成好幾段 text。只讀 parts[0] 會拿到
+// 思考內容或半截 JSON，解析必然失敗——而且錯誤看起來像「模型壞掉」，
+// 實際上是我們沒把回應讀完整。
+function candText(cand) {
+  const parts = (cand && cand.content && cand.content.parts) || [];
+  return parts
+    .filter((p) => p && p.thought !== true && typeof p.text === 'string')
+    .map((p) => p.text)
+    .join('');
+}
+
 async function uploadFile(file, apiKey, onProgress) {
   throwIfAborted();
   report(onProgress, 'upload', 5, '準備上傳…');
@@ -423,7 +437,7 @@ async function transcribeWindow(uploads, mime, model, start, end, whole, onProgr
   );
   const data = await res.json();
   const cand = data && data.candidates && data.candidates[0];
-  const text = cand && cand.content && cand.content.parts && cand.content.parts[0] && cand.content.parts[0].text;
+  const text = candText(cand);
   const truncated = cand && cand.finishReason === 'MAX_TOKENS';
   let segments = null;
   if (text) {
@@ -510,8 +524,7 @@ async function summarizeSegments(segments, keys, model, onProgress) {
   );
   const data = await res.json();
   const out =
-    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
-    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    candText(data && data.candidates && data.candidates[0]);
   if (!out) throw new Error('未取得摘要結果，請重試。');
   let r;
   try {
@@ -750,7 +763,7 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
       `加強${meta.label}中…（${Math.floor(i / BATCH) + 1}/${nb}）`
     );
     const data = await res.json();
-    const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    const out = candText(data && data.candidates && data.candidates[0]);
     // 批次失敗就 throw（不可靜默吞掉 → 否則整區被「缺一批」的不完整清單取代）
     if (!out) throw new Error(`加強${meta.label}時第 ${Math.floor(i / BATCH) + 1} 批無回應，請重試`);
     let r;
@@ -814,7 +827,7 @@ async function polishItems(all, meta, model, variants, onProgress) {
     `整理潤飾${meta.label}中…`
   );
   const data = await res.json();
-  const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+  const out = candText(data && data.candidates && data.candidates[0]);
   if (!out) throw new Error(`整理${meta.label}時無回應，請重試`);
   let r;
   try {
@@ -902,8 +915,7 @@ export async function askMeeting(transcript, summary, question, apiKeys, opts = 
   );
   const data = await res.json();
   const out =
-    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
-    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    candText(data && data.candidates && data.candidates[0]);
   if (!out) throw new Error('未取得回答，請重試。');
   return out.trim();
 }
@@ -968,7 +980,7 @@ export async function extractTerms(segments, apiKeys, opts = {}) {
       `挑出專有名詞中…（${Math.floor(i / BATCH) + 1}/${nb}）`
     );
     const data = await res.json();
-    const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    const out = candText(data && data.candidates && data.candidates[0]);
     if (!out) continue;
     try {
       const r = JSON.parse(out);
@@ -1028,7 +1040,7 @@ async function groupTermVariants(items, variants, model, onProgress) {
       '比對同一名稱的不同寫法…'
     );
     const data = await res.json();
-    const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    const out = candText(data && data.candidates && data.candidates[0]);
     groups = (JSON.parse(out).groups) || [];
   } catch (_) {
     return items.map((x) => ({ ...x, alts: [] })); // 分組失敗不影響主流程
@@ -1215,8 +1227,7 @@ export async function generateNotes(segments, apiKeys, opts = {}) {
   );
   const data = await res.json();
   const out =
-    data && data.candidates && data.candidates[0] && data.candidates[0].content &&
-    data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    candText(data && data.candidates && data.candidates[0]);
   if (!out) throw new Error('未取得學習筆記，請重試。');
   let r;
   try {
@@ -1270,7 +1281,7 @@ export async function enhanceNotesSection(segments, section, apiKeys, opts = {})
       `加強${meta.label}中…（${Math.floor(i / BATCH) + 1}/${nb}）`
     );
     const data = await res.json();
-    const out = data && data.candidates && data.candidates[0] && data.candidates[0].content && data.candidates[0].content.parts && data.candidates[0].content.parts[0] && data.candidates[0].content.parts[0].text;
+    const out = candText(data && data.candidates && data.candidates[0]);
     if (!out) throw new Error(`加強${meta.label}時第 ${Math.floor(i / BATCH) + 1} 批無回應，請重試`);
     let r;
     try {
@@ -1349,7 +1360,7 @@ async function translatePayload(variants, model, label, payload, schema, onProgr
   );
   const data = await res.json();
   const cand = data && data.candidates && data.candidates[0];
-  const out = cand && cand.content && cand.content.parts && cand.content.parts[0] && cand.content.parts[0].text;
+  const out = candText(cand);
   if (!out) throw new Error('未取得翻譯結果，請重試。');
   try {
     return JSON.parse(out);
