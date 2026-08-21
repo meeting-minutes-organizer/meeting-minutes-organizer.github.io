@@ -464,7 +464,7 @@ async function transcribeWindow(uploads, mime, model, start, end, whole, onProgr
       (data && data.promptFeedback && data.promptFeedback.blockReason) ||
       '未回報';
     const peek = text ? `回應開頭：${String(text).slice(0, 120)}` : '這次回應沒有任何文字內容。';
-    throw new Error(`辨識結果解析失敗，請重試一次。（finishReason: ${reason}）${peek}`);
+    throw new Error(`辨識結果解析失敗，請重試一次。（型號 ${model}／finishReason: ${reason}）${peek}`);
   }
   return segments;
 }

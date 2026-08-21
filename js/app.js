@@ -11,7 +11,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v81';
+const APP_VERSION = 'v82';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -739,6 +739,7 @@ function paintJob() {
       <div class="prog-bar"><div class="prog-fill" id="pf"></div></div>
       <div class="prog-label" id="pl">準備中…</div>
       <div class="prog-key" id="pk" hidden></div>
+      <div class="prog-key" id="pm" hidden></div>
       <div class="prog-time" id="pt">已等待 0:00</div>`;
     c.dataset.ready = '1';
   }
@@ -756,6 +757,18 @@ function paintJob() {
       pk.hidden = false;
     } else {
       pk.hidden = true;
+    }
+  }
+  // 辨識型號是「Google 有什麼就挑最新的」自動決定的，不寫死在程式裡。
+  // 不顯示出來的話，同一份程式在不同時間跑出不同結果會完全無從察覺。
+  const pm = c.querySelector('#pm');
+  if (pm) {
+    const model = jobState.job && jobState.job.model;
+    if (model) {
+      pm.textContent = '🤖 辨識型號：' + model;
+      pm.hidden = false;
+    } else {
+      pm.hidden = true;
     }
   }
 }
