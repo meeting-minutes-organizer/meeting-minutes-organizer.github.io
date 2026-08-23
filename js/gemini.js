@@ -683,6 +683,13 @@ export function isQuotaStall(e) {
   return /額度受限，暫時無法完成/.test((e && e.message) || '');
 }
 
+// 內容被安全過濾器擋下（PROHIBITED_CONTENT / SAFETY）。
+// 這不是重試能解的：對半再問、換金鑰都沒用，過濾器照樣擋。
+// 唯一有效的出路是換一個沒有這種過濾的引擎（Whisper）或換型號。
+export function isContentBlocked(e) {
+  return /PROHIBITED_CONTENT|finishReason:\s*SAFETY|blockReason/i.test((e && e.message) || '');
+}
+
 // 把一批文字轉成繁體中文（台灣用語）。給 Groq（Whisper）備援路線用：
 // Whisper 中文常輸出簡體。純文字請求 token 很便宜，固定走省額度模型。
 // 轉換失敗不丟錯——寧可給簡體逐字稿，也不能讓已經辨識完的內容整段作廢。

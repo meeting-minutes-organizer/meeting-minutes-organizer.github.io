@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, convertToTraditional } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional } from './gemini.js';
 import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
@@ -13,7 +13,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v85';
+const APP_VERSION = 'v86';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -866,19 +866,22 @@ async function topUpMissingKeys(job, ui) {
 // Groq 備援：Gemini 卡死時用 Whisper 把「這一段」辨識完。
 // 回傳 segments；條件不足（沒設 Groq 金鑰／原始音檔已不在／不是 m4a）回傳 null。
 // 需要原始檔案是因為 Groq 收的是音訊位元組——Gemini 那邊只有雲端 fileUri，Groq 用不了。
+// 多檔模式（使用者自己分段錄好）：每段對應一支檔案，用該支檔案整檔辨識。
 let groqIndexCache = null; // { file, index }：同一場多段共用同一份 MP4 索引
 async function groqFallbackForChunk(job, c, ui, idx, total) {
-  if (!hasGroqKey() || !job._file || job.multiFile) return null;
+  if (!hasGroqKey()) return null;
+  const file = job.multiFile ? job._files && job._files[idx - 1] : job._file;
+  if (!file) return null;
   try {
-    if (!groqIndexCache || groqIndexCache.file !== job._file) {
-      groqIndexCache = { file: job._file, index: await readM4aIndex(job._file) };
+    if (!groqIndexCache || groqIndexCache.file !== file) {
+      groqIndexCache = { file, index: await readM4aIndex(file) };
     }
   } catch (_) {
     return null; // 不是 m4a／索引讀不出來 → 這條備援走不了
   }
   ui.setLabel(`Gemini 卡住，第 ${idx}/${total} 段改用 Groq（Whisper）辨識…`);
   const raw = await groqTranscribeRange(
-    job._file,
+    file,
     groqIndexCache.index,
     c.start || 0,
     c.end || groqIndexCache.index.durationSec,
@@ -1033,13 +1036,32 @@ async function processJob(job) {
             }
           }
         }
-        // 第二層補救：Gemini 額度見底或所有型號都忙 → Groq（Whisper）接手這一段。
-        // Groq 的額度與 Gemini 完全獨立。代價：這一段分不出說話者（統一標「說話者」）。
+        // 第二層補救：額度見底、所有型號都忙、或內容被安全過濾器擋（PROHIBITED_CONTENT）
+        // → Groq（Whisper）接手這一段。Groq 額度獨立、也沒有內容過濾器。
+        // 代價：這一段分不出說話者（統一標「說話者」）。
         if (err) {
-          if (!(isModelOverloaded(err) || isQuotaStall(err))) throw err;
+          if (!(isModelOverloaded(err) || isQuotaStall(err) || isContentBlocked(err))) throw err;
           const segs = await groqFallbackForChunk(job, c, ui, i + 1, n);
-          if (segs === null) throw err; // 條件不足（沒金鑰/沒原檔/不是 m4a）→ 維持原本的錯誤
-          c.segments = segs;
+          if (segs) {
+            c.segments = segs;
+          } else if (isContentBlocked(err)) {
+            // Groq 走不了（沒金鑰/沒原檔/不是 m4a）→ 換型號再試一次：
+            // 過濾器是跟著型號走的，舊型號常常不會誤判同一段內容。
+            const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
+            if (!alt) {
+              throw new Error(
+                err.message +
+                  '\n這段被 Gemini 的內容過濾器擋下（會議內容常被誤判）。到設定頁填入 Groq 備援金鑰後按「繼續」，這種段落會自動改用 Whisper 辨識。'
+              );
+            }
+            ui.setLabel(`內容被 ${job.model} 的過濾器擋下，改用 ${alt} 重試…`);
+            job.model = alt;
+            await persistJob(job);
+            paintJob();
+            c.segments = await run();
+          } else {
+            throw err; // 條件不足（沒金鑰/沒原檔/不是 m4a）→ 維持原本的錯誤
+          }
         }
       }
       ui.stopEase();
