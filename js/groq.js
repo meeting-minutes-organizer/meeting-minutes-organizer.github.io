@@ -8,9 +8,12 @@
 // 單檔上限 25MB。額度與 Gemini 完全獨立，這正是它當備援的價值。
 
 import { buildAdts, frameAtTime } from './mp4.js';
+import { SUMMARY_PROMPT } from './gemini.js';
 
 const GROQ_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
+const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = 'whisper-large-v3-turbo';
+const GROQ_LLM = 'llama-3.3-70b-versatile';
 
 // 單一請求的上限：檔案 25MB（免費層）。留餘裕給 multipart 邊界與標頭。
 const MAX_SLICE_BYTES = 23 * 1024 * 1024;
@@ -90,6 +93,56 @@ export async function groqTranscribeBlob(blob, apiKey, onLabel) {
           return out;
         })
         .filter((s) => s.text);
+    }
+    const bodyText = await res.text();
+    if (res.status === 429 && attempt < 2) {
+      const wait = Math.min(120000, parseRetryAfterMs(res, bodyText));
+      if (onLabel) onLabel(`Groq 額度暫滿，等待 ${Math.round(wait / 1000)} 秒後重試…`);
+      await sleep(wait);
+      continue;
+    }
+    throw new Error(describeGroqError(res.status, bodyText));
+  }
+}
+
+// 摘要備援：Gemini 額度見底時，用 Groq 的 Llama 模型整理摘要。
+// 中文品質低於 Gemini（尤其台灣用語），所以只當備援，不當主力。
+// 提示詞沿用 Gemini 的那份，確保兩邊輸出同一種結構。
+export async function groqSummarize(segments, apiKey, onLabel) {
+  const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
+  for (let attempt = 0; ; attempt++) {
+    const res = await fetch(GROQ_CHAT_URL, {
+      method: 'POST',
+      headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({
+        model: GROQ_LLM,
+        temperature: 0.3,
+        response_format: { type: 'json_object' },
+        messages: [
+          {
+            role: 'user',
+            content:
+              SUMMARY_PROMPT + text +
+              `\n\n只輸出一個 JSON 物件，鍵固定為：actionItems（字串陣列）、mainPoints（字串陣列）、qa（{q,a} 物件陣列）。不要輸出任何其他文字。中文一律用繁體中文（台灣用語）。`,
+          },
+        ],
+      }),
+    });
+    if (res.ok) {
+      const data = await res.json();
+      const out = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
+      if (!out) throw new Error('Groq 摘要沒有回傳內容，請重試。');
+      let r;
+      try {
+        r = JSON.parse(out);
+      } catch (_) {
+        throw new Error('Groq 摘要結果解析失敗，請重試。');
+      }
+      return {
+        actionItems: Array.isArray(r.actionItems) ? r.actionItems : [],
+        mainPoints: Array.isArray(r.mainPoints) ? r.mainPoints : [],
+        qa: Array.isArray(r.qa) ? r.qa : [],
+      };
     }
     const bodyText = await res.text();
     if (res.status === 429 && attempt < 2) {

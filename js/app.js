@@ -6,14 +6,14 @@ import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
 import { readM4aIndex } from './mp4.js';
-import { getGroqKey, setGroqKey, hasGroqKey, groqTranscribeRange } from './groq.js';
+import { getGroqKey, setGroqKey, hasGroqKey, groqTranscribeRange, groqSummarize } from './groq.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
 import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v86';
+const APP_VERSION = 'v87';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1082,7 +1082,16 @@ async function processJob(job) {
       return acc.concat(segs);
     }, []);
     const summaryModel = await pickModelForKeys(getApiKeyEntries(), { preferLite: false });
-    const summary = await summarize(allSegs, getApiKeyEntries(), summaryModel, ui.onProgress);
+    let summary;
+    try {
+      summary = await summarize(allSegs, getApiKeyEntries(), summaryModel, ui.onProgress);
+    } catch (e) {
+      // 逐字稿已經全部到手，不能讓摘要一步毀掉整場 →
+      // Gemini 額度見底／忙線／被過濾器擋時，改用 Groq 的 Llama 整理摘要。
+      if (isAborted() || !hasGroqKey() || !(isQuotaStall(e) || isModelOverloaded(e) || isContentBlocked(e))) throw e;
+      ui.setLabel('Gemini 卡住，改用 Groq（Llama）整理摘要…');
+      summary = await groqSummarize(allSegs, getGroqKey(), (s) => ui.setLabel(s));
+    }
     ui.stopEase();
     ui.setBar(100);
     ui.setLabel('完成！');

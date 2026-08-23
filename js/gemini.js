@@ -737,8 +737,11 @@ export async function convertToTraditional(texts, apiKeys, onProgress) {
           if (typeof s === 'string' && s.trim()) out[i + j] = s.replace(/^\d+\.\s*/, '');
         }
       }
-    } catch (_) {
-      // 這批轉不了就保留原文，繼續下一批
+    } catch (e) {
+      // 額度見底時每一批都會白白等一輪（一批最多等 2.5 分鐘）。
+      // 第一批就撞牆代表後面的批次也過不了 → 直接放棄整個轉換，保留原文。
+      if (isQuotaStall(e)) break;
+      // 其他錯誤只放棄這一批，繼續下一批
     }
   }
   return out;
@@ -787,7 +790,7 @@ const SUMMARY_SCHEMA = {
   },
   required: ['actionItems', 'mainPoints', 'qa'],
 };
-const SUMMARY_PROMPT =
+export const SUMMARY_PROMPT =
   `以下是一段會議逐字稿。請依內容整理成三類，並使用「與逐字稿相同的主要語言」` +
   `（逐字稿主要是中文就用繁體中文、主要是英文就用英文、主要是日文就用日文）：\n` +
   `- actionItems（待辦事項）：逐條列出，每項結尾標註「[DRI: 負責人]」，判斷不出負責人就寫「[DRI: 待指派]」（英文用 [DRI: TBD]）。\n` +
