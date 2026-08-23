@@ -1,17 +1,19 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, convertToTraditional } from './gemini.js';
 import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
+import { readM4aIndex } from './mp4.js';
+import { getGroqKey, setGroqKey, hasGroqKey, groqTranscribeRange } from './groq.js';
 import { formatDate, defaultTitle, transcriptToText } from './format.js';
 import { matchMeeting } from './search.js';
 import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v84';
+const APP_VERSION = 'v85';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -861,6 +863,35 @@ async function topUpMissingKeys(job, ui) {
   }
 }
 
+// Groq 備援：Gemini 卡死時用 Whisper 把「這一段」辨識完。
+// 回傳 segments；條件不足（沒設 Groq 金鑰／原始音檔已不在／不是 m4a）回傳 null。
+// 需要原始檔案是因為 Groq 收的是音訊位元組——Gemini 那邊只有雲端 fileUri，Groq 用不了。
+let groqIndexCache = null; // { file, index }：同一場多段共用同一份 MP4 索引
+async function groqFallbackForChunk(job, c, ui, idx, total) {
+  if (!hasGroqKey() || !job._file || job.multiFile) return null;
+  try {
+    if (!groqIndexCache || groqIndexCache.file !== job._file) {
+      groqIndexCache = { file: job._file, index: await readM4aIndex(job._file) };
+    }
+  } catch (_) {
+    return null; // 不是 m4a／索引讀不出來 → 這條備援走不了
+  }
+  ui.setLabel(`Gemini 卡住，第 ${idx}/${total} 段改用 Groq（Whisper）辨識…`);
+  const raw = await groqTranscribeRange(
+    job._file,
+    groqIndexCache.index,
+    c.start || 0,
+    c.end || groqIndexCache.index.durationSec,
+    getGroqKey(),
+    (s) => ui.setLabel(`第 ${idx}/${total} 段：${s}`)
+  );
+  if (!raw.length) return null;
+  // Whisper 中文常輸出簡體 → 用 Gemini 純文字便宜地轉繁體（失敗就保留原文，不中斷）
+  ui.setLabel(`第 ${idx}/${total} 段辨識完成，轉繁體中…`);
+  const texts = await convertToTraditional(raw.map((s) => s.text), getApiKeyEntries(), ui.onProgress);
+  return raw.map((s, j) => ({ ...s, text: texts[j] || s.text }));
+}
+
 async function processJob(job) {
   const est = Math.max(30, Math.round((job.durationSec || 0) * 0.5) + 25);
   clearAbort(); // 上一場若被停止過，這裡要先解除，否則新任務一開始就被擋掉
@@ -982,16 +1013,34 @@ async function processJob(job) {
       try {
         c.segments = await run();
       } catch (e) {
-        // 型號忙線（503）換金鑰救不了——每把金鑰打的都是同一個型號。
-        // 改用排名中的下一個型號，整場沿用，不要每段都重踩一次。
-        if (isAborted() || !isModelOverloaded(e)) throw e;
-        const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
-        if (!alt) throw e;
-        ui.setLabel(`${job.model} 忙線中，改用 ${alt} 重試…`);
-        job.model = alt;
-        await persistJob(job);
-        paintJob();
-        c.segments = await run();
+        if (isAborted()) throw e;
+        // 第一層補救：型號忙線（503）→ 換排名中的下一個型號，整場沿用。
+        // 換金鑰救不了——每把金鑰打的都是同一個型號。
+        let err = e;
+        if (isModelOverloaded(err)) {
+          const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
+          if (alt) {
+            ui.setLabel(`${job.model} 忙線中，改用 ${alt} 重試…`);
+            job.model = alt;
+            await persistJob(job);
+            paintJob();
+            try {
+              c.segments = await run();
+              err = null;
+            } catch (e2) {
+              if (isAborted()) throw e2;
+              err = e2;
+            }
+          }
+        }
+        // 第二層補救：Gemini 額度見底或所有型號都忙 → Groq（Whisper）接手這一段。
+        // Groq 的額度與 Gemini 完全獨立。代價：這一段分不出說話者（統一標「說話者」）。
+        if (err) {
+          if (!(isModelOverloaded(err) || isQuotaStall(err))) throw err;
+          const segs = await groqFallbackForChunk(job, c, ui, i + 1, n);
+          if (segs === null) throw err; // 條件不足（沒金鑰/沒原檔/不是 m4a）→ 維持原本的錯誤
+          c.segments = segs;
+        }
       }
       ui.stopEase();
       await persistJob(job);
@@ -2328,6 +2377,16 @@ function renderSettings() {
       </div>
     </div>
     <div class="card">
+      <p style="margin-top:0"><b>🛟 Groq 備援金鑰（選填）</b></p>
+      <input type="password" id="groqKey" placeholder="貼上 Groq API 金鑰（gsk_ 開頭）" value="${esc(getGroqKey())}" autocomplete="off" autocapitalize="off" spellcheck="false" />
+      <button class="big" id="saveGroqKey" style="margin-top:8px">儲存</button>
+      <div class="hint">
+        <b>不填也能用。</b>填了之後，當 Gemini 額度用盡或型號忙線導致某一段辨識卡死時，App 會自動改用 Groq（Whisper 模型）把那一段跑完——Groq 的免費額度（每天 8 小時音訊）與 Gemini 完全獨立。<br>
+        到 <a href="https://console.groq.com/keys" target="_blank" rel="noopener">console.groq.com/keys</a> 免費申請。<br>
+        ⚠️ 代價：Groq 跑的段落<b>分不出說話者</b>（統一標「說話者」），且只支援 m4a／mp4 錄音檔。文字會自動轉繁體。
+      </div>
+    </div>
+    <div class="card">
       <p style="margin-top:0"><b>🎚️ 辨識模型</b></p>
       <div class="lang-toggle" id="modelToggle">
         <button data-mp="auto" class="${getModelPref() === 'lite' ? '' : 'active'}">自動（品質優先）</button>
@@ -2407,6 +2466,10 @@ function renderSettings() {
     setTimeout(() => (b.textContent = '複製網址'), 1800);
   };
   document.getElementById('addKey').onclick = () => addRow({ name: '', key: '' });
+  document.getElementById('saveGroqKey').onclick = () => {
+    setGroqKey(document.getElementById('groqKey').value);
+    toast(hasGroqKey() ? '已儲存 Groq 金鑰' : '已清除 Groq 金鑰');
+  };
   document.getElementById('saveKey').onclick = () => {
     const rows = Array.from(keyList.querySelectorAll('.key-row')).map((r) => ({
       name: r.querySelector('.key-name').value,

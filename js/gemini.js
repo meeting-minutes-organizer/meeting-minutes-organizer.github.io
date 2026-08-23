@@ -677,6 +677,66 @@ export async function nextModelForKeys(apiKeys, current, opts = {}) {
   return i >= 0 && i + 1 < list.length ? list[i + 1] : null;
 }
 
+// 429 收場（所有金鑰輪完、等待也等完仍失敗）：這是「Gemini 額度暫時見底」。
+// 判斷依據是上面 429 收場訊息的固定開頭；改那段訊息時這裡要一起改。
+export function isQuotaStall(e) {
+  return /額度受限，暫時無法完成/.test((e && e.message) || '');
+}
+
+// 把一批文字轉成繁體中文（台灣用語）。給 Groq（Whisper）備援路線用：
+// Whisper 中文常輸出簡體。純文字請求 token 很便宜，固定走省額度模型。
+// 轉換失敗不丟錯——寧可給簡體逐字稿，也不能讓已經辨識完的內容整段作廢。
+const S2T_SCHEMA = {
+  type: 'object',
+  properties: { texts: { type: 'array', items: { type: 'string' } } },
+  required: ['texts'],
+};
+export async function convertToTraditional(texts, apiKeys, onProgress) {
+  const kos = toKeyObjs(apiKeys);
+  if (!texts || !texts.length || !kos.length) return texts;
+  let model;
+  try {
+    model = await resolveModel(kos.map((k) => k.key), { preferLite: true });
+  } catch (_) {
+    return texts;
+  }
+  const BATCH = 80;
+  const out = texts.slice();
+  for (let i = 0; i < texts.length; i += BATCH) {
+    const batch = texts.slice(i, i + BATCH);
+    try {
+      const res = await postJsonRotating(
+        kos,
+        (ko) => ({
+          url: `${BASE}/v1beta/models/${model}:generateContent?key=${ko.key}`,
+          body: JSON.stringify({
+            contents: [{ parts: [{ text:
+              `把下列 ${batch.length} 句轉成繁體中文（台灣用語）。只做簡繁與用語轉換，不改寫、不增刪內容、不合併句子。` +
+              `輸出 texts 陣列，長度必須是 ${batch.length}，順序不變。\n\n` +
+              batch.map((t, j) => `${j + 1}. ${t}`).join('\n') }] }],
+            generationConfig: { responseMimeType: 'application/json', responseSchema: S2T_SCHEMA, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
+          }),
+        }),
+        onProgress,
+        '轉繁體中'
+      );
+      const data = await res.json();
+      const t = candText(data && data.candidates && data.candidates[0]);
+      const arr = JSON.parse(t).texts;
+      // 長度不符代表模型亂動了內容 → 這批放棄轉換，保留原文
+      if (Array.isArray(arr) && arr.length === batch.length) {
+        for (let j = 0; j < batch.length; j++) {
+          const s = arr[j];
+          if (typeof s === 'string' && s.trim()) out[i + j] = s.replace(/^\d+\.\s*/, '');
+        }
+      }
+    } catch (_) {
+      // 這批轉不了就保留原文，繼續下一批
+    }
+  }
+  return out;
+}
+
 // 503／UNAVAILABLE：這是「這個型號現在忙不過來」，不是金鑰或音檔的問題。
 // 換金鑰沒有用——每把金鑰打的都是同一個型號。
 export function isModelOverloaded(e) {
