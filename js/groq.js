@@ -13,7 +13,36 @@ import { SUMMARY_PROMPT } from './gemini.js';
 const GROQ_URL = 'https://api.groq.com/openai/v1/audio/transcriptions';
 const GROQ_CHAT_URL = 'https://api.groq.com/openai/v1/chat/completions';
 const GROQ_MODEL = 'whisper-large-v3-turbo';
-const GROQ_LLM = 'llama-3.3-70b-versatile';
+// 文字模型不寫死。之前寫死 llama-3.3-70b-versatile，Groq 2026-06 把它
+// 從免費層下架後備援就 404——跟 Gemini 那邊「模型跟著平台變」是同一類問題。
+// 改成問 Groq 有什麼、按偏好挑（偏好順序：官方建議的替代者優先）。
+const GROQ_MODELS_URL = 'https://api.groq.com/openai/v1/models';
+const LLM_PREFER = [/gpt-oss-120b/i, /qwen/i, /llama.*(70b|maverick|scout)/i, /gpt-oss/i, /llama/i];
+// 不能拿來聊天的：語音、安全過濾、嵌入、語音合成
+const LLM_EXCLUDE = /whisper|tts|guard|embed|allam|moderation/i;
+let llmCache = null;
+export function resetGroqModelCache() {
+  llmCache = null;
+}
+async function pickGroqLLM(apiKey) {
+  if (llmCache) return llmCache;
+  const res = await fetch(GROQ_MODELS_URL, { headers: { Authorization: `Bearer ${apiKey}` } });
+  if (!res.ok) throw new Error(describeGroqError(res.status, await res.text()));
+  const data = await res.json();
+  const ids = ((data && data.data) || []).map((m) => m && m.id).filter((id) => id && !LLM_EXCLUDE.test(id));
+  for (const re of LLM_PREFER) {
+    const hit = ids.find((id) => re.test(id));
+    if (hit) {
+      llmCache = hit;
+      return hit;
+    }
+  }
+  if (ids.length) {
+    llmCache = ids[0];
+    return ids[0];
+  }
+  throw new Error('這把 Groq 金鑰查不到可用的文字模型。');
+}
 
 // 單一請求的上限：檔案 25MB（免費層）。留餘裕給 multipart 邊界與標頭。
 const MAX_SLICE_BYTES = 23 * 1024 * 1024;
@@ -73,11 +102,14 @@ const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 送一個音訊 Blob 給 Groq，回傳 [{speaker, text, t}]（t 為相對這個 Blob 開頭的秒數）。
 // 429 依 Groq 指示的秒數等待後重試（最多 2 次）；其他錯誤直接丟出。
+// Whisper 也可能被下架（跟文字模型同一課）。turbo 404 就退回標準版。
+const WHISPER_MODELS = [GROQ_MODEL, 'whisper-large-v3'];
 export async function groqTranscribeBlob(blob, apiKey, onLabel) {
+  let mi = 0;
   for (let attempt = 0; ; attempt++) {
     const form = new FormData();
     form.append('file', blob, 'chunk.aac');
-    form.append('model', GROQ_MODEL);
+    form.append('model', WHISPER_MODELS[mi]);
     form.append('language', 'zh');
     form.append('response_format', 'verbose_json');
     const res = await fetch(GROQ_URL, { method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body: form });
@@ -95,6 +127,10 @@ export async function groqTranscribeBlob(blob, apiKey, onLabel) {
         .filter((s) => s.text);
     }
     const bodyText = await res.text();
+    if (res.status === 404 && /model_not_found|does not exist/i.test(bodyText) && mi + 1 < WHISPER_MODELS.length) {
+      mi++;
+      continue;
+    }
     if (res.status === 429 && attempt < 2) {
       const wait = Math.min(120000, parseRetryAfterMs(res, bodyText));
       if (onLabel) onLabel(`Groq 額度暫滿，等待 ${Math.round(wait / 1000)} 秒後重試…`);
@@ -110,8 +146,9 @@ export async function groqTranscribeBlob(blob, apiKey, onLabel) {
 // 429 依 Groq 指示等待後重試（最多 2 次）；其他錯誤直接丟出。
 export async function groqChatText(prompt, apiKey, wantJson, onLabel) {
   for (let attempt = 0; ; attempt++) {
+    const model = await pickGroqLLM(apiKey);
     const body = {
-      model: GROQ_LLM,
+      model,
       temperature: 0.3,
       messages: [{ role: 'user', content: prompt }],
     };
@@ -128,6 +165,11 @@ export async function groqChatText(prompt, apiKey, wantJson, onLabel) {
       return out;
     }
     const bodyText = await res.text();
+    // 快取的模型剛好被下架 → 清掉快取重挑一次（清單會重新抓，挑到的就是還活著的）
+    if (res.status === 404 && /model_not_found|does not exist/i.test(bodyText) && attempt < 2) {
+      resetGroqModelCache();
+      continue;
+    }
     if (res.status === 429 && attempt < 2) {
       const wait = Math.min(120000, parseRetryAfterMs(res, bodyText));
       if (onLabel) onLabel(`Groq 額度暫滿，等待 ${Math.round(wait / 1000)} 秒後重試…`);
