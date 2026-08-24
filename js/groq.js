@@ -105,44 +105,27 @@ export async function groqTranscribeBlob(blob, apiKey, onLabel) {
   }
 }
 
-// 摘要備援：Gemini 額度見底時，用 Groq 的 Llama 模型整理摘要。
-// 中文品質低於 Gemini（尤其台灣用語），所以只當備援，不當主力。
-// 提示詞沿用 Gemini 的那份，確保兩邊輸出同一種結構。
-export async function groqSummarize(segments, apiKey, onLabel) {
-  const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
+// 通用的 Groq（Llama）文字請求：送一段提示詞，回覆內容字串。
+// wantJson 為真時開啟 JSON 模式（Llama 保證輸出合法 JSON）。
+// 429 依 Groq 指示等待後重試（最多 2 次）；其他錯誤直接丟出。
+export async function groqChatText(prompt, apiKey, wantJson, onLabel) {
   for (let attempt = 0; ; attempt++) {
+    const body = {
+      model: GROQ_LLM,
+      temperature: 0.3,
+      messages: [{ role: 'user', content: prompt }],
+    };
+    if (wantJson) body.response_format = { type: 'json_object' };
     const res = await fetch(GROQ_CHAT_URL, {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        model: GROQ_LLM,
-        temperature: 0.3,
-        response_format: { type: 'json_object' },
-        messages: [
-          {
-            role: 'user',
-            content:
-              SUMMARY_PROMPT + text +
-              `\n\n只輸出一個 JSON 物件，鍵固定為：actionItems（字串陣列）、mainPoints（字串陣列）、qa（{q,a} 物件陣列）。不要輸出任何其他文字。中文一律用繁體中文（台灣用語）。`,
-          },
-        ],
-      }),
+      body: JSON.stringify(body),
     });
     if (res.ok) {
       const data = await res.json();
       const out = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
-      if (!out) throw new Error('Groq 摘要沒有回傳內容，請重試。');
-      let r;
-      try {
-        r = JSON.parse(out);
-      } catch (_) {
-        throw new Error('Groq 摘要結果解析失敗，請重試。');
-      }
-      return {
-        actionItems: Array.isArray(r.actionItems) ? r.actionItems : [],
-        mainPoints: Array.isArray(r.mainPoints) ? r.mainPoints : [],
-        qa: Array.isArray(r.qa) ? r.qa : [],
-      };
+      if (!out) throw new Error('Groq 沒有回傳內容，請重試。');
+      return out;
     }
     const bodyText = await res.text();
     if (res.status === 429 && attempt < 2) {
@@ -153,6 +136,31 @@ export async function groqSummarize(segments, apiKey, onLabel) {
     }
     throw new Error(describeGroqError(res.status, bodyText));
   }
+}
+
+// 摘要備援：Gemini 額度見底時，用 Groq 的 Llama 模型整理摘要。
+// 中文品質低於 Gemini（尤其台灣用語），所以只當備援，不當主力。
+// 提示詞沿用 Gemini 的那份，確保兩邊輸出同一種結構。
+export async function groqSummarize(segments, apiKey, onLabel) {
+  const text = (segments || []).map((s) => `${s.speaker}：${s.text}`).join('\n');
+  const out = await groqChatText(
+    SUMMARY_PROMPT + text +
+      `\n\n只輸出一個 JSON 物件，鍵固定為：actionItems（字串陣列）、mainPoints（字串陣列）、qa（{q,a} 物件陣列）。不要輸出任何其他文字。中文一律用繁體中文（台灣用語）。`,
+    apiKey,
+    true,
+    onLabel
+  );
+  let r;
+  try {
+    r = JSON.parse(out);
+  } catch (_) {
+    throw new Error('Groq 摘要結果解析失敗，請重試。');
+  }
+  return {
+    actionItems: Array.isArray(r.actionItems) ? r.actionItems : [],
+    mainPoints: Array.isArray(r.mainPoints) ? r.mainPoints : [],
+    qa: Array.isArray(r.qa) ? r.qa : [],
+  };
 }
 
 // 用 Groq 辨識 m4a 檔案的 [startSec, endSec) 這段。

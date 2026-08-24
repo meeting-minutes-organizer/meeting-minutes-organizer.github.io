@@ -386,10 +386,43 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
   if (lastStatus === 403 && /permission|not exist/i.test(lastText)) {
     throw new Error('雲端音檔已過期或無法存取，請按「新增會議」重新上傳這個檔案。');
   }
+  // 收場前最後一搏：純文字請求（摘要／翻譯／加強／問答／筆記／轉繁體）改走
+  // Groq 的 Llama——它的額度與 Gemini 完全獨立。帶音檔的請求轉不了（Llama 聽不了聲音）。
+  if (lastStatus === 429 || isTransientStatus(lastStatus)) {
+    try {
+      const rescued = await groqTextRescue(makeReq(vs[0]).body, onProgress, act);
+      if (rescued) return rescued;
+    } catch (_) {
+      // 備援也失敗 → 照原本的方式報錯
+    }
+  }
   if (lastStatus === 429) {
     throw new Error('額度受限，暫時無法完成。稍等 1–2 分鐘再按「繼續」通常就會繼續跑（進度已保存）。若一直卡住，代表這段音檔對免費層的「每分鐘用量」太大，建議到 AI Studio 開通 API 付費（最有效），或用較短的錄音。');
   }
   throw new Error(`${act}失敗 (${lastStatus || ''})：${(lastText || '請重試').slice(0, 300)}`);
+}
+
+// 把「純文字的 Gemini 請求」轉成 Groq（Llama）請求，並把回覆包回 Gemini 的回應形狀，
+// 讓上層所有解析程式（candText → JSON.parse → 各自的 schema 檢查）原封不動照用。
+// 轉不了（帶音檔／沒設 Groq 金鑰）回傳 null，由呼叫端照原本的方式收場。
+async function groqTextRescue(geminiBody, onProgress, act) {
+  if (/file_data|fileData/.test(geminiBody)) return null;
+  const { hasGroqKey, getGroqKey, groqChatText } = await import('./groq.js');
+  if (!hasGroqKey()) return null;
+  const o = JSON.parse(geminiBody);
+  const prompt = (o.contents || [])
+    .map((c) => ((c && c.parts) || []).map((p) => (p && p.text) || '').join('\n'))
+    .join('\n');
+  if (!prompt.trim()) return null;
+  const wantJson = !!(o.generationConfig && o.generationConfig.responseMimeType === 'application/json');
+  report(onProgress, 'transcribe', null, `Gemini 額度受限，${act}改用 Groq（Llama）…`);
+  const content = await groqChatText(
+    wantJson ? prompt + '\n\n只輸出符合上述要求的 JSON 物件，不要輸出任何其他文字。中文一律用繁體中文（台灣用語）。' : prompt,
+    getGroqKey(),
+    wantJson
+  );
+  const fake = { candidates: [{ content: { parts: [{ text: content }] } }] };
+  return { ok: true, status: 200, json: async () => fake, text: async () => content };
 }
 
 // ---- 逐字稿（可依時間分段，長錄音自動切割）----

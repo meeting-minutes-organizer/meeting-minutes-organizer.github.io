@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, ABORT_MSG } from './gemini.js';
 import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
@@ -13,7 +13,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v87';
+const APP_VERSION = 'v88';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -266,19 +266,37 @@ function paintDetailTasks() {
   const id = currentDetailId();
   if (!id) return;
   let busy = false;
+  let runningBtn = null;
   document.querySelectorAll('[data-task]').forEach((b) => {
     const t = detailTasks.get(taskId(id, b.dataset.task));
     if (t) {
       busy = true;
-      if (!b.dataset.origLabel) b.dataset.origLabel = b.textContent;
-      b.textContent = '⏳ ' + t.label;
+      runningBtn = b;
+      if (!b.dataset.origLabel) {
+        b.dataset.origLabel = b.textContent;
+        b._origOnclick = b.onclick;
+        // 額度受限時的等待可能長達半分鐘以上，一定要留一條取消的路
+        b.onclick = () => {
+          if (jobRunning) {
+            toast('辨識進行中，先到辨識頁停止，或等這項工作自己結束');
+            return;
+          }
+          requestAbort();
+          toast('正在取消…（最多等目前這一步結束）');
+        };
+      }
+      b.textContent = `⏳ ${t.label}（點此取消）`;
     } else if (b.dataset.origLabel) {
       b.textContent = b.dataset.origLabel;
       b.removeAttribute('data-orig-label');
+      if (b._origOnclick) {
+        b.onclick = b._origOnclick;
+        b._origOnclick = null;
+      }
     }
   });
-  // 有工作在跑就停用整排動作鈕，避免同時開第二個
-  document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = busy));
+  // 有工作在跑就停用其他動作鈕，避免同時開第二個；執行中的那顆保持可按（用來取消）
+  document.querySelectorAll('.act-btn').forEach((x) => (x.disabled = busy && x !== runningBtn));
 }
 function detailBusy() {
   const id = currentDetailId();
@@ -291,6 +309,9 @@ async function runDetailTask(meetingId, key, initialLabel, fn) {
   const k = taskId(meetingId, key);
   detailTasks.set(k, { label: initialLabel });
   paintDetailTasks();
+  // 上一次取消留下的中止旗標要先清掉，否則新工作一開始就被擋。
+  // 辨識進行中不清（旗標屬於辨識任務，不能替它解除）。
+  if (!jobRunning) clearAbort();
   try {
     return await fn((msg) => {
       const t = detailTasks.get(k);
@@ -299,6 +320,10 @@ async function runDetailTask(meetingId, key, initialLabel, fn) {
         paintDetailTasks();
       }
     });
+  } catch (e) {
+    // 使用者按了取消：把辨識用的中止訊息換成中性的「已取消」，避免嚇到人
+    if (e && e.message === ABORT_MSG) throw new Error('已取消');
+    throw e;
   } finally {
     detailTasks.delete(k);
     paintDetailTasks();
