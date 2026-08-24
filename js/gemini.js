@@ -470,7 +470,12 @@ async function groqTextRescue(geminiBody, onProgress, act, note) {
   };
   if (/file_data|fileData/.test(geminiBody)) return 記('這個請求帶了音檔，Llama 聽不了聲音，只能等 Gemini');
   const { hasGroqKey, getGroqKey, groqChatText } = await import('./groq.js');
-  if (!hasGroqKey()) return 記('尚未設定 Groq 金鑰（設定 → 貼上 gsk_ 開頭的金鑰）');
+  if (!hasGroqKey()) {
+    // 這是唯一「使用者當下就能自己修好」的原因，不能等到最後報錯才講——
+    // 使用者常在等待中途就取消，那一行原因就永遠沒人看到。
+    report(onProgress, 'transcribe', null, '⚠️ 這台裝置未設定 Groq 金鑰，無法啟用備援（設定 → Groq 備援金鑰）。繼續等 Gemini…');
+    return 記('尚未設定 Groq 金鑰（設定 → 貼上 gsk_ 開頭的金鑰）');
+  }
   const o = JSON.parse(geminiBody);
   const prompt = (o.contents || [])
     .map((c) => ((c && c.parts) || []).map((p) => (p && p.text) || '').join('\n'))
