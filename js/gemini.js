@@ -288,6 +288,24 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
   let vi = 0;
   let lastText = '';
   let lastStatus = 0;
+  // Groq 備援只試一次（試過就記住），而且**為什麼沒成功要留下來**（見收場那一段）。
+  let triedGroq = false;
+  const groqNote = { reason: '' };
+  const tryGroqRescue = async (st, text) => {
+    const 忙 = /UNAVAILABLE|high demand|overloaded/i.test(text || '');
+    if (!(st === 429 || isTransientStatus(st) || 忙)) {
+      groqNote.reason = `Gemini 的狀態是 ${st || '未知'}，不屬於「額度／忙線」，備援不適用`;
+      return null;
+    }
+    try {
+      return await groqTextRescue(makeReq(vs[0]).body, onProgress, act, groqNote);
+    } catch (e) {
+      // 這裡以前是 `catch (_) {}`。備援自己炸掉是最需要講出來的一種，
+      // 因為它長得跟「沒有備援」一模一樣。
+      groqNote.reason = String(`Groq 回覆失敗：${(e && e.message) || e}`).slice(0, 200);
+      return null;
+    }
+  };
   for (let round = 0; round <= MAX_ROUNDS; round++) {
     let sawTransient = false;
     let retryMs = 0;
@@ -376,46 +394,90 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       throw new Error(`${act}失敗 (${effStatus})：${lastText.slice(0, 300)}`);
     }
     if (!sawTransient || round >= MAX_ROUNDS) break;
+    // 【2026-08-24】純文字請求不要等——第一輪全部金鑰都受限就直接轉 Groq。
+    //
+    // 舊版把 Groq 備援放在迴圈**跑完之後**（最多 5 輪／累計 2.5 分鐘）。對「帶音檔」
+    // 的請求那是對的：Llama 聽不了聲音，等 Gemini 是唯一的路。但摘要／問答／翻譯／
+    // 專有名詞抽取都是**純文字**，Groq 第一秒就做得了——讓使用者盯著倒數 2.5 分鐘，
+    // 換到的是「等完之後才發現本來就不必等」。
+    //
+    // 503（模型忙線）尤其如此：換金鑰沒有用（每把金鑰打的都是同一個型號），
+    // 而等待也只是賭 Google 的負載會掉下來。
+    if (!triedGroq) {
+      triedGroq = true;
+      const 早救 = await tryGroqRescue(lastStatus, lastText);
+      if (早救) return 早救;
+    }
     const wait = Math.min(35000, retryMs || 8000 * (round + 1));
     if (totalWait + wait > MAX_TOTAL_WAIT) break;
     totalWait += wait;
-    report(onProgress, 'transcribe', null, `${partTag}${vs.length > 1 ? '所有金鑰' : '額度'}暫時受限，等待 ${Math.round(wait / 1000)} 秒後再試…`);
+    // 503 是「這個型號忙不過來」，不是金鑰的問題——措辭不要讓使用者去換金鑰或加額度。
+    const 忙線 = lastStatus === 503 || /UNAVAILABLE|high demand|overloaded/i.test(lastText || '');
+    report(
+      onProgress,
+      'transcribe',
+      null,
+      忙線
+        ? `${partTag}型號忙線中（不是你的金鑰問題），等待 ${Math.round(wait / 1000)} 秒後再試…`
+        : `${partTag}${vs.length > 1 ? '所有金鑰' : '額度'}暫時受限，等待 ${Math.round(wait / 1000)} 秒後再試…`
+    );
     await sleep(wait);
     throwIfAborted();
   }
   if (lastStatus === 403 && /permission|not exist/i.test(lastText)) {
     throw new Error('雲端音檔已過期或無法存取，請按「新增會議」重新上傳這個檔案。');
   }
-  // 收場前最後一搏：純文字請求（摘要／翻譯／加強／問答／筆記／轉繁體）改走
-  // Groq 的 Llama——它的額度與 Gemini 完全獨立。帶音檔的請求轉不了（Llama 聽不了聲音）。
-  if (lastStatus === 429 || isTransientStatus(lastStatus)) {
-    try {
-      const rescued = await groqTextRescue(makeReq(vs[0]).body, onProgress, act);
-      if (rescued) return rescued;
-    } catch (_) {
-      // 備援也失敗 → 照原本的方式報錯
-    }
+  // 收場前最後一搏（若迴圈裡那一次還沒試過，例如第一輪就 break 掉）。
+  if (!triedGroq) {
+    triedGroq = true;
+    const 晚救 = await tryGroqRescue(lastStatus, lastText);
+    if (晚救) return 晚救;
+  }
+  // 【2026-08-24】備援為什麼沒生效，一定要講出來。
+  //
+  // 舊版是 `catch (_) {}`——「Groq 也掛了」「金鑰無效」「prompt 是空的」「根本沒被叫到」
+  // 四種情況長成同一句 Gemini 錯誤，使用者結構上分不出來，於是「看起來沒有轉 Groq」
+  // 這個觀察永遠無法被證實或推翻。留痕不是禮貌，是讓人能判斷下一步做什麼。
+  const 備援註 = groqNote.reason ? `\n（Groq 備援未生效：${groqNote.reason}）` : '';
+  if (lastStatus === 503 || /UNAVAILABLE|high demand|overloaded/i.test(lastText || '')) {
+    throw new Error(
+      `${act}失敗：這個型號現在忙不過來（503 高負載）。這**不是**你的金鑰或額度的問題——` +
+        `每把金鑰打的都是同一個型號，換金鑰、加額度都沒有用。` +
+        `建議：到設定改用另一個型號，或等幾分鐘再按一次。${備援註}`
+    );
   }
   if (lastStatus === 429) {
-    throw new Error('額度受限，暫時無法完成。稍等 1–2 分鐘再按「繼續」通常就會繼續跑（進度已保存）。若一直卡住，代表這段音檔對免費層的「每分鐘用量」太大，建議到 AI Studio 開通 API 付費（最有效），或用較短的錄音。');
+    throw new Error(
+      '額度受限，暫時無法完成。稍等 1–2 分鐘再按「繼續」通常就會繼續跑（進度已保存）。' +
+        '若一直卡住，代表這段音檔對免費層的「每分鐘用量」太大，建議到 AI Studio 開通 API 付費（最有效），或用較短的錄音。' +
+        備援註
+    );
   }
-  throw new Error(`${act}失敗 (${lastStatus || ''})：${(lastText || '請重試').slice(0, 300)}`);
+  throw new Error(`${act}失敗 (${lastStatus || ''})：${(lastText || '請重試').slice(0, 300)}${備援註}`);
 }
 
 // 把「純文字的 Gemini 請求」轉成 Groq（Llama）請求，並把回覆包回 Gemini 的回應形狀，
 // 讓上層所有解析程式（candText → JSON.parse → 各自的 schema 檢查）原封不動照用。
 // 轉不了（帶音檔／沒設 Groq 金鑰）回傳 null，由呼叫端照原本的方式收場。
-async function groqTextRescue(geminiBody, onProgress, act) {
-  if (/file_data|fileData/.test(geminiBody)) return null;
+async function groqTextRescue(geminiBody, onProgress, act, note) {
+  // 【2026-08-24】每一條「轉不了」都要寫進 note.reason。
+  // 這支函式原本四個出口全部 `return null`，於是呼叫端只知道「沒救到」，
+  // 分不出是「帶音檔本來就轉不了」還是「你根本沒填 Groq 金鑰」——
+  // 而這兩件事使用者要做的處置完全不同。
+  const 記 = (why) => {
+    if (note) note.reason = why;
+    return null;
+  };
+  if (/file_data|fileData/.test(geminiBody)) return 記('這個請求帶了音檔，Llama 聽不了聲音，只能等 Gemini');
   const { hasGroqKey, getGroqKey, groqChatText } = await import('./groq.js');
-  if (!hasGroqKey()) return null;
+  if (!hasGroqKey()) return 記('尚未設定 Groq 金鑰（設定 → 貼上 gsk_ 開頭的金鑰）');
   const o = JSON.parse(geminiBody);
   const prompt = (o.contents || [])
     .map((c) => ((c && c.parts) || []).map((p) => (p && p.text) || '').join('\n'))
     .join('\n');
-  if (!prompt.trim()) return null;
+  if (!prompt.trim()) return 記('這個請求沒有可轉成純文字的內容');
   const wantJson = !!(o.generationConfig && o.generationConfig.responseMimeType === 'application/json');
-  report(onProgress, 'transcribe', null, `Gemini 額度受限，${act}改用 Groq（Llama）…`);
+  report(onProgress, 'transcribe', null, `Gemini 忙線／額度受限，${act}改用 Groq（Llama）…`);
   const content = await groqChatText(
     wantJson ? prompt + '\n\n只輸出符合上述要求的 JSON 物件，不要輸出任何其他文字。中文一律用繁體中文（台灣用語）。' : prompt,
     getGroqKey(),
