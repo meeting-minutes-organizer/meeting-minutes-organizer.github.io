@@ -135,6 +135,34 @@ function report(onProgress, phase, pct, message, keyName) {
   if (onProgress) onProgress({ phase, pct, message, keyName });
 }
 
+// 逾時的 fetch。
+//
+// 原本直接用 fetch()，沒有任何逾時：只要連線卡住（手機切網、基地台換手、
+// Google 那端不回），這個 Promise 就永遠不 resolve——重試迴圈停在那一格，
+// 備援也永遠輪不到。畫面看起來就是「卡在切換金鑰重試中好幾分鐘」。
+// 逾時當成暫時性錯誤處理：換下一把金鑰，或觸發 Groq 備援。
+const FETCH_TIMEOUT_MS = 90000;
+export const TIMEOUT_MSG = '連線逾時';
+async function fetchWithTimeout(url, init, ms = FETCH_TIMEOUT_MS) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms);
+  // 使用者按停止時也要能立刻中斷這條連線，不必等逾時
+  const onAbort = () => ctl.abort();
+  abortWaiters.add(onAbort);
+  try {
+    return await fetch(url, { ...(init || {}), signal: ctl.signal });
+  } catch (e) {
+    if (e && e.name === 'AbortError') {
+      if (aborted) throw new Error(ABORT_MSG);
+      throw new Error(TIMEOUT_MSG);
+    }
+    throw e;
+  } finally {
+    clearTimeout(timer);
+    abortWaiters.delete(onAbort);
+  }
+}
+
 // 從回應中取出模型真正的答案。
 //
 // 思考型模型（gemini 3.x 起是預設）回傳的 parts 不只一段：可能夾帶「思考摘要」
@@ -293,8 +321,11 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
   const groqNote = { reason: '' };
   const tryGroqRescue = async (st, text) => {
     const 忙 = /UNAVAILABLE|high demand|overloaded/i.test(text || '');
-    if (!(st === 429 || isTransientStatus(st) || 忙)) {
-      groqNote.reason = `Gemini 的狀態是 ${st || '未知'}，不屬於「額度／忙線」，備援不適用`;
+    // st === 0 代表連線層就失敗（逾時／斷線／CORS），根本沒拿到 HTTP 狀態。
+    // 這一樣是「Gemini 這條路現在走不通」，備援該接手——原本被這道關卡擋掉。
+    const 連線失敗 = !st;
+    if (!(st === 429 || isTransientStatus(st) || 忙 || 連線失敗)) {
+      groqNote.reason = `Gemini 的狀態是 ${st}，不屬於「額度／忙線／連線失敗」，備援不適用`;
       return null;
     }
     try {
@@ -314,11 +345,14 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       const v = vs[vi % vs.length];
       vi++;
       const multi = vs.length > 1;
+      // 帶上第幾把金鑰／第幾輪：卡住時看得出「是不是還在動」。
+      // 原本只寫「切換金鑰重試中…」，連線掛住時畫面完全靜止，無從分辨。
+      const 進度 = multi ? `（金鑰 ${(vi - 1) % vs.length + 1}/${vs.length}${round ? `・第 ${round + 1} 輪` : ''}）` : '';
       report(
         onProgress,
         'transcribe',
         null,
-        round === 0 && k === 0 ? label : multi ? `${partTag}切換金鑰重試中…` : `${partTag}重試中…（第 ${round} 次）`,
+        round === 0 && k === 0 ? label : multi ? `${partTag}切換金鑰重試中…${進度}` : `${partTag}重試中…（第 ${round} 次）`,
         v.name
       );
       const { url, body: rawBody } = makeReq(v);
@@ -334,9 +368,13 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       if (v.key) recordUse(v.key);
       let res;
       try {
-        res = await fetch(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
+        res = await fetchWithTimeout(url, { method: 'POST', headers: { 'Content-Type': 'application/json' }, body });
       } catch (e) {
+        if (isAbortError(e)) throw e;
+        // 逾時／斷線：記下狀態，讓收場訊息與備援判斷有依據（原本這裡什麼都沒留）
         sawTransient = true;
+        lastStatus = lastStatus || 0;
+        lastText = (e && e.message) || '網路錯誤';
         continue;
       }
       if (res.ok) return res;

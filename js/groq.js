@@ -26,7 +26,7 @@ export function resetGroqModelCache() {
 }
 async function pickGroqLLM(apiKey) {
   if (llmCache) return llmCache;
-  const res = await fetch(GROQ_MODELS_URL, { headers: { Authorization: `Bearer ${apiKey}` } });
+  const res = await fetchT(GROQ_MODELS_URL, { headers: { Authorization: `Bearer ${apiKey}` } }, 20000);
   if (!res.ok) throw new Error(describeGroqError(res.status, await res.text()));
   const data = await res.json();
   const ids = ((data && data.data) || []).map((m) => m && m.id).filter((id) => id && !LLM_EXCLUDE.test(id));
@@ -100,6 +100,21 @@ function parseRetryAfterMs(res, bodyText) {
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// Groq 這邊同樣需要逾時：備援自己掛住的話，使用者只會看到畫面靜止，
+// 比「備援失敗」更難判斷。上傳音訊給的時間長一些。
+async function fetchT(url, init, ms) {
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), ms || 90000);
+  try {
+    return await fetch(url, { ...(init || {}), signal: ctl.signal });
+  } catch (e) {
+    if (e && e.name === 'AbortError') throw new Error('Groq 連線逾時');
+    throw e;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 // 送一個音訊 Blob 給 Groq，回傳 [{speaker, text, t}]（t 為相對這個 Blob 開頭的秒數）。
 // 429 依 Groq 指示的秒數等待後重試（最多 2 次）；其他錯誤直接丟出。
 // Whisper 也可能被下架（跟文字模型同一課）。turbo 404 就退回標準版。
@@ -112,7 +127,7 @@ export async function groqTranscribeBlob(blob, apiKey, onLabel) {
     form.append('model', WHISPER_MODELS[mi]);
     form.append('language', 'zh');
     form.append('response_format', 'verbose_json');
-    const res = await fetch(GROQ_URL, { method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body: form });
+    const res = await fetchT(GROQ_URL, { method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body: form }, 180000);
     if (res.ok) {
       const data = await res.json();
       const segs = (data && data.segments) || [];
@@ -153,11 +168,11 @@ export async function groqChatText(prompt, apiKey, wantJson, onLabel) {
       messages: [{ role: 'user', content: prompt }],
     };
     if (wantJson) body.response_format = { type: 'json_object' };
-    const res = await fetch(GROQ_CHAT_URL, {
+    const res = await fetchT(GROQ_CHAT_URL, {
       method: 'POST',
       headers: { Authorization: `Bearer ${apiKey}`, 'Content-Type': 'application/json' },
       body: JSON.stringify(body),
-    });
+    }, 120000);
     if (res.ok) {
       const data = await res.json();
       const out = data && data.choices && data.choices[0] && data.choices[0].message && data.choices[0].message.content;
