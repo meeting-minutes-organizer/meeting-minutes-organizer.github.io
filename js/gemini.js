@@ -948,11 +948,15 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
   const model = await resolveModel(kos.map((k) => k.key), { preferLite: false }); // 加強固定用品質模型
   const variants = kos.map((k) => ({ key: k.key, name: k.name }));
   const segs = segments || [];
-  const BATCH = 80;
-  const nb = Math.max(1, Math.ceil(segs.length / BATCH));
+  // 批次大 → 請求少。免費層真正稀缺的是「每日請求數」，不是單次請求的大小：
+  // 142 分鐘的逐字稿用 80 句一批要打 12+ 次，240 句一批只要 4 次。
+  // 安全網：單批輸出被截斷／解析失敗就對半重試，回到小批次，完整性不變。
+  const BATCH = 240;
+  const MIN_BATCH = 60;
+  const total = segs.length;
   const all = [];
-  for (let i = 0; i < segs.length; i += BATCH) {
-    const text = segs.slice(i, i + BATCH).map((s) => `${s.speaker}：${s.text}`).join('\n');
+  const runRange = async (from, to) => {
+    const text = segs.slice(from, to).map((s) => `${s.speaker}：${s.text}`).join('\n');
     const prompt =
       `以下是一段會議逐字稿。請${meta.instr}。使用與逐字稿相同的主要語言。務求完整、不要遺漏、不要精簡。` +
       `若這段沒有相關內容就回傳空陣列。只輸出 JSON {"items":[...]}。\n\n逐字稿：\n` +
@@ -967,20 +971,32 @@ export async function enhanceSection(segments, section, apiKeys, opts = {}) {
         }),
       }),
       onProgress,
-      `加強${meta.label}中…（${Math.floor(i / BATCH) + 1}/${nb}）`
+      `加強${meta.label}中…（第 ${from + 1}–${to} 句／共 ${total} 句）`
     );
     const data = await res.json();
     const out = candText(data && data.candidates && data.candidates[0]);
-    // 批次失敗就 throw（不可靜默吞掉 → 否則整區被「缺一批」的不完整清單取代）
-    if (!out) throw new Error(`加強${meta.label}時第 ${Math.floor(i / BATCH) + 1} 批無回應，請重試`);
-    let r;
-    try {
-      r = JSON.parse(out);
-    } catch (_) {
-      throw new Error(`加強${meta.label}時第 ${Math.floor(i / BATCH) + 1} 批解析失敗，請重試`);
+    let r = null;
+    if (out) {
+      try {
+        r = JSON.parse(out);
+      } catch (_) {
+        r = null;
+      }
+    }
+    if (!r) {
+      // 輸出壞掉（截斷／格式跑掉）→ 對半重試；額度類錯誤不會走到這裡（上面直接 throw）
+      if (to - from > MIN_BATCH) {
+        const mid = (from + to) >> 1;
+        await runRange(from, mid);
+        await runRange(mid, to);
+        return;
+      }
+      // 批次失敗就 throw（不可靜默吞掉 → 否則整區被「缺一批」的不完整清單取代）
+      throw new Error(`加強${meta.label}時第 ${from + 1}–${to} 句解析失敗，請重試`);
     }
     if (Array.isArray(r.items)) all.push(...r.items);
-  }
+  };
+  for (let i = 0; i < total; i += BATCH) await runRange(i, Math.min(total, i + BATCH));
   if (!all.length) return all;
   return polishItems(all, meta, model, variants, onProgress);
 }
@@ -1163,11 +1179,13 @@ export async function extractTerms(segments, apiKeys, opts = {}) {
   const model = await resolveModel(kos.map((k) => k.key), { preferLite: false }); // 固定用品質模型
   const variants = kos.map((k) => ({ key: k.key, name: k.name }));
   const segs = segments || [];
-  const BATCH = 80;
-  const nb = Math.max(1, Math.ceil(segs.length / BATCH));
+  // 批次策略同 enhanceSection：批次大省請求數，單批壞掉就對半重試。
+  const BATCH = 240;
+  const MIN_BATCH = 60;
+  const total = segs.length;
   const map = new Map(); // term → item（跨批次去重）
-  for (let i = 0; i < segs.length; i += BATCH) {
-    const text = segs.slice(i, i + BATCH).map((s) => `${s.speaker}：${s.text}`).join('\n');
+  const runRange = async (from, to) => {
+    const text = segs.slice(from, to).map((s) => `${s.speaker}：${s.text}`).join('\n');
     const prompt =
       `以下是一段會議逐字稿。請挑出裡面的「專有名詞」：人名(person)、公司或組織(org)、產品(product)、地名(place)、國家(country)、專業術語(term)。\n` +
       `重點：優先挑出「可能被語音辨識聽錯或拼錯」的詞。一般常見字詞不要放。\n` +
@@ -1184,20 +1202,34 @@ export async function extractTerms(segments, apiKeys, opts = {}) {
         }),
       }),
       onProgress,
-      `挑出專有名詞中…（${Math.floor(i / BATCH) + 1}/${nb}）`
+      `挑出專有名詞中…（第 ${from + 1}–${to} 句／共 ${total} 句）`
     );
     const data = await res.json();
     const out = candText(data && data.candidates && data.candidates[0]);
-    if (!out) continue;
-    try {
-      const r = JSON.parse(out);
-      for (const it of r.items || []) {
-        const term = (it.term || '').trim();
-        if (!term) continue;
-        if (!map.has(term)) map.set(term, { t: term, cat: it.category || 'term', fix: (it.fix || '').trim() });
+    let r = null;
+    if (out) {
+      try {
+        r = JSON.parse(out);
+      } catch (_) {
+        r = null;
       }
-    } catch (_) {}
-  }
+    }
+    if (!r) {
+      if (to - from > MIN_BATCH) {
+        const mid = (from + to) >> 1;
+        await runRange(from, mid);
+        await runRange(mid, to);
+      }
+      // 掃詞向來允許單批漏掉（寧可少挑幾個詞也不中斷整個掃描）→ 縮到最小仍壞就略過
+      return;
+    }
+    for (const it of r.items || []) {
+      const term = (it.term || '').trim();
+      if (!term) continue;
+      if (!map.has(term)) map.set(term, { t: term, cat: it.category || 'term', fix: (it.fix || '').trim() });
+    }
+  };
+  for (let i = 0; i < total; i += BATCH) await runRange(i, Math.min(total, i + BATCH));
   const items = Array.from(map.values());
   if (items.length < 2) return items;
   return await groupTermVariants(items, variants, model, onProgress);
