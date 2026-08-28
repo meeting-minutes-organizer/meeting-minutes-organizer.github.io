@@ -125,7 +125,9 @@ export async function groqTranscribeBlob(blob, apiKey, onLabel) {
     const form = new FormData();
     form.append('file', blob, 'chunk.aac');
     form.append('model', WHISPER_MODELS[mi]);
-    form.append('language', 'zh');
+    // 不指定 language：讓 Whisper 自動偵測。
+    // 之前寫死 'zh'，英文錄音會被當成中文處理（甚至被翻譯）——「原文」就不原了。
+    // 中文自動偵測可能輸出簡體，本來就有轉繁體那一步接著處理。
     form.append('response_format', 'verbose_json');
     const res = await fetchT(GROQ_URL, { method: 'POST', headers: { Authorization: `Bearer ${apiKey}` }, body: form }, 180000);
     if (res.ok) {

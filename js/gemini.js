@@ -618,7 +618,10 @@ const SEG_SCHEMA = {
 const SEG_PROMPT =
   `你是專業會議記錄助理。請把這段會議錄音整理成「語者分段逐字稿」：\n` +
   `- 辨識不同說話者，標記「說話者1」「說話者2」…同一個人自始至終用同一標籤。\n` +
-  `- 中文一律使用繁體中文（台灣用語），英文保留原文。\n` +
+  // 舊寫法「中文一律使用繁體中文，英文保留原文」被新模型讀成「輸出要是中文」，
+  // 整場英文會議被翻譯掉——逐字稿的第一原則必須明寫：照錄，不翻譯。
+  `- 逐字稿要「原文照錄」：說話者說什麼語言就寫什麼語言，**絕對不可翻譯**。英文就寫英文、日文就寫日文。\n` +
+  `- 只有說話內容本身是中文時，才以繁體中文（台灣用語）書寫，不用簡體。\n` +
   `- 每個 segment 格式 {"speaker":"說話者1","text":"…","t":秒數}，適度斷句。
 ` +
   `- t 是這句開始的「秒數」，相對於這個音檔開頭（整數即可）。抓不準就略過該句的 t，不要亂猜。`;
@@ -927,7 +930,8 @@ export async function convertToTraditional(texts, apiKeys, onProgress) {
           url: `${BASE}/v1beta/models/${model}:generateContent?key=${ko.key}`,
           body: JSON.stringify({
             contents: [{ parts: [{ text:
-              `把下列 ${batch.length} 句轉成繁體中文（台灣用語）。只做簡繁與用語轉換，不改寫、不增刪內容、不合併句子。` +
+              `把下列 ${batch.length} 句裡的「簡體中文」轉成繁體中文（台灣用語）。只做簡繁與用語轉換，不改寫、不增刪內容、不合併句子。` +
+              `不是中文的句子（英文、日文等）原樣輸出，絕對不可翻譯。` +
               `輸出 texts 陣列，長度必須是 ${batch.length}，順序不變。\n\n` +
               batch.map((t, j) => `${j + 1}. ${t}`).join('\n') }] }],
             generationConfig: { responseMimeType: 'application/json', responseSchema: S2T_SCHEMA, maxOutputTokens: 65535, thinkingConfig: { thinkingBudget: 0 } },
