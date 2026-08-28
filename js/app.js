@@ -1,7 +1,7 @@
-import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref } from './settings.js';
+import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref, getModelLock, setModelLock } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, ABORT_MSG } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, ABORT_MSG, getModelChoices, isModelBusy } from './gemini.js';
 import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
@@ -13,7 +13,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v94';
+const APP_VERSION = 'v95';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1014,6 +1014,19 @@ async function processJob(job) {
     }
 
     await topUpMissingKeys(job, ui);
+
+    // 續傳的場次帶著當初存的型號。若它正在忙線記憶中、或使用者已在設定指定型號，
+    // 改用現在的最佳選擇——否則續傳永遠重撞同一面牆。
+    if (isModelBusy(job.model) || getModelLock()) {
+      try {
+        const fresher = await pickModelForKeys(getApiKeyEntries());
+        if (fresher && fresher !== job.model) {
+          job.model = fresher;
+          await persistJob(job);
+          paintJob();
+        }
+      } catch (_) {}
+    }
 
     // 2) 逐段辨識（每段完成即存檔）
     const n = job.chunks.length;
@@ -2452,6 +2465,14 @@ function renderSettings() {
       <div class="hint">
         免費層一直撞到「用量上限（429）」跑不動時，切到<b>省額度</b>：改用 <b>Flash-Lite</b> 模型，免費層每分鐘額度大很多（約 4 倍），長錄音較不會卡；代價是辨識品質略降一點。可隨時切回。
       </div>
+      <p style="margin-bottom:6px"><b>指定型號</b></p>
+      <select id="modelLock" style="width:100%">
+        <option value="">自動（依品質排序，忙線自動跳過）</option>
+      </select>
+      <div class="hint">
+        最新型號（如 3.7）剛推出時常因全球搶用而 503 塞車。想避開就在這裡指定一個舊一點的型號；
+        清單旁標「（忙線中）」代表它最近 10 分鐘內撞過 503。指定的型號也塞車時，仍會自動往下換，不會卡死。
+      </div>
     </div>
     <div class="card">
       <p style="margin-top:0"><b>☁️ GitHub 雲端同步（跨裝置記憶）</b>
@@ -2527,6 +2548,37 @@ function renderSettings() {
     setGroqKey(document.getElementById('groqKey').value);
     toast(hasGroqKey() ? '已儲存 Groq 金鑰' : '已清除 Groq 金鑰');
   };
+  // 指定型號下拉：清單要問 Google 才有，載入前先放目前鎖定的值避免閃跳
+  const lockSel = document.getElementById('modelLock');
+  if (lockSel) {
+    const curLock = getModelLock();
+    if (curLock) {
+      const opt = document.createElement('option');
+      opt.value = curLock;
+      opt.textContent = curLock;
+      lockSel.appendChild(opt);
+      lockSel.value = curLock;
+    }
+    if (hasApiKey()) {
+      getModelChoices(getApiKeyEntries())
+        .then((choices) => {
+          if (!document.body.contains(lockSel) || !choices.length) return;
+          lockSel.innerHTML = '<option value="">自動（依品質排序，忙線自動跳過）</option>';
+          for (const c of choices) {
+            const opt = document.createElement('option');
+            opt.value = c.name;
+            opt.textContent = c.name + (c.busy ? '（忙線中）' : '');
+            lockSel.appendChild(opt);
+          }
+          lockSel.value = getModelLock() || '';
+        })
+        .catch(() => {}); // 拿不到清單就維持現狀，不擋設定頁
+    }
+    lockSel.onchange = () => {
+      setModelLock(lockSel.value);
+      toast(lockSel.value ? `辨識固定優先使用 ${lockSel.value}` : '已改回自動選擇');
+    };
+  }
   document.getElementById('saveKey').onclick = () => {
     const rows = Array.from(keyList.querySelectorAll('.key-row')).map((r) => ({
       name: r.querySelector('.key-name').value,

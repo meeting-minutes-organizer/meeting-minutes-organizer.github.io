@@ -7,6 +7,7 @@
 // - responseSchema 強制結構化輸出，segments 陣列做語者辨識。
 
 import { recordUse, recordCooldown, getKeyStatus } from './usage.js';
+import { getModelLock } from './settings.js';
 
 const BASE = 'https://generativelanguage.googleapis.com';
 
@@ -98,22 +99,52 @@ export function clearModelCache() {
 // 模型忙線記憶：503 是「這個模型現在扛不住」，跟金鑰無關。
 // 記住 10 分鐘，期間所有選模型的地方都自動跳過它——
 // 否則每一段、每一個功能都要重新撞一次同一面牆（一次 20 秒起跳）。
-const modelBusyUntil = new Map();
+const BUSY_LS = 'model_busy_until';
+// 存 localStorage：忙線記憶要撐得過重新整理。原本只放記憶體，
+// 使用者一重開 App 就忘光，每一場都得重新撞一次 3.7 的牆。
+function loadBusy() {
+  try {
+    const o = JSON.parse(localStorage.getItem(BUSY_LS)) || {};
+    const m = new Map();
+    for (const k in o) if (typeof o[k] === 'number' && o[k] > Date.now()) m.set(k, o[k]);
+    return m;
+  } catch (_) {
+    return new Map();
+  }
+}
+const modelBusyUntil = loadBusy();
+function saveBusy() {
+  try {
+    localStorage.setItem(BUSY_LS, JSON.stringify(Object.fromEntries(modelBusyUntil)));
+  } catch (_) {}
+}
 const MODEL_BUSY_MS = 10 * 60 * 1000;
 export function markModelBusy(model, ms = MODEL_BUSY_MS) {
-  if (model) modelBusyUntil.set(model, Date.now() + ms);
+  if (!model) return;
+  modelBusyUntil.set(model, Date.now() + ms);
+  saveBusy();
 }
 export function isModelBusy(model) {
   const t = modelBusyUntil.get(model);
   if (!t) return false;
   if (Date.now() > t) {
     modelBusyUntil.delete(model);
+    saveBusy();
     return false;
   }
   return true;
 }
 export function clearModelBusy() {
   modelBusyUntil.clear();
+  try {
+    localStorage.removeItem(BUSY_LS);
+  } catch (_) {}
+}
+// 使用者指定的型號永遠排第一（它也忙線時 pickNonBusy 仍會往下跳，不會卡死）
+function applyLock(list) {
+  const lock = getModelLock();
+  if (!lock || !list.includes(lock)) return list;
+  return [lock, ...list.filter((x) => x !== lock)];
 }
 // 全部都在忙時退回第一名：用忙的模型碰運氣，也比直接沒有模型可用好
 const pickNonBusy = (list) => list.find((m) => !isModelBusy(m)) || list[0];
@@ -125,7 +156,7 @@ async function resolveModel(apiKeys, opts = {}) {
   const ck = String(lite);
   if (modelCache[ck]) {
     const list = modelListCache[ck] && modelListCache[ck].length ? modelListCache[ck] : [modelCache[ck]];
-    return pickNonBusy(list);
+    return pickNonBusy(applyLock(list));
   }
   const keys = (Array.isArray(apiKeys) ? apiKeys : [apiKeys]).filter(Boolean);
   if (!keys.length) throw new Error('尚未設定 API 金鑰');
@@ -148,7 +179,7 @@ async function resolveModel(apiKeys, opts = {}) {
     if (name) {
       modelListCache[ck] = ranked;
       modelCache[ck] = name;
-      return pickNonBusy(ranked);
+      return pickNonBusy(applyLock(ranked));
     }
     lastErr = new Error('這組金鑰找不到可用型號，請確認金鑰是否正確、或是否已啟用 Gemini API。');
   }
@@ -513,11 +544,13 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
   // 這個觀察永遠無法被證實或推翻。留痕不是禮貌，是讓人能判斷下一步做什麼。
   const 備援註 = groqNote.reason ? `\n（Groq 備援未生效：${groqNote.reason}）` : '';
   if (lastStatus === 503 || /UNAVAILABLE|high demand|overloaded/i.test(lastText || '')) {
-    throw new Error(
+    const err = new Error(
       `${act}失敗：這個型號現在忙不過來（503 高負載）。這**不是**你的金鑰或額度的問題——` +
         `每把金鑰打的都是同一個型號，換金鑰、加額度都沒有用。` +
         `建議：到設定改用另一個型號，或等幾分鐘再按一次。${備援註}`
     );
+    err.geminiStatus = 503; // 結構化標記：isModelOverloaded 靠這個，不靠比對訊息文字
+    throw err;
   }
   if (lastStatus === 429) {
     throw new Error(
@@ -845,7 +878,7 @@ export async function nextModelForKeys(apiKeys, current, opts = {}) {
       return null;
     }
   }
-  const list = modelListCache[ck] || [];
+  const list = applyLock(modelListCache[ck] || []);
   const i = list.indexOf(current);
   if (i < 0) return null;
   // 往清單下方找第一個「不在忙線中」的：3.6 也忙就再往下（3.6-lite、2.5…）
@@ -923,11 +956,25 @@ export async function convertToTraditional(texts, apiKeys, onProgress) {
   return out;
 }
 
+// 設定頁下拉選單用：回傳這把金鑰能用的完整型號清單（依品質排名），
+// 並附上目前是否在忙線記憶中，讓使用者看得到「哪個現在塞車」。
+export async function getModelChoices(apiKeys) {
+  const kos = toKeyObjs(apiKeys);
+  if (!kos.length) return [];
+  await resolveModel(kos.map((k) => k.key), { preferLite: false });
+  return (modelListCache['false'] || []).map((m) => ({ name: m, busy: isModelBusy(m) }));
+}
+
 // 503／UNAVAILABLE：這是「這個型號現在忙不過來」，不是金鑰或音檔的問題。
 // 換金鑰沒有用——每把金鑰打的都是同一個型號。
 export function isModelOverloaded(e) {
+  // 結構化標記優先：postJsonRotating 丟忙線錯誤時會掛上 geminiStatus。
+  // 教訓：v89 把收場訊息改寫成中文「忙不過來（503 高負載）」（全形括號），
+  // 這裡的 /\(503\)/（半形）就再也比對不到——「忙線換模型」整條鏈默默失效，
+  // 直到使用者發現「錯誤裡看不到有試 3.6」。判斷不能只靠比對人類看的文字。
+  if (e && e.geminiStatus === 503) return true;
   const m = (e && e.message) || '';
-  return /\(503\)|UNAVAILABLE|high demand|overloaded/i.test(m);
+  return /\(503\)|UNAVAILABLE|high demand|overloaded|忙不過來|503 高負載/i.test(m);
 }
 // 把一個音檔（Blob/File）上傳到每一把金鑰的專案，回傳 { uploads:[{key,name,fileUri}], mime }
 export async function uploadBlobToKeys(blob, apiKeys, onProgress, opts = {}) {
