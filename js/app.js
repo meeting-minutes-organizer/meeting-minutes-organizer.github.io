@@ -13,7 +13,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v93';
+const APP_VERSION = 'v94';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1042,23 +1042,24 @@ async function processJob(job) {
         c.segments = await run();
       } catch (e) {
         if (isAborted()) throw e;
-        // 第一層補救：型號忙線（503）→ 換排名中的下一個型號，整場沿用。
+        // 第一層補救：型號忙線（503）→ 沿著排名清單一路往下換（3.7 → 3.6 →
+        // 3.6-lite → 2.5…），不是只換一次。已知忙線的型號會被自動跳過
+        // （postJsonRotating 撞到 503 時已標記 10 分鐘忙線）。
         // 換金鑰救不了——每把金鑰打的都是同一個型號。
         let err = e;
-        if (isModelOverloaded(err)) {
+        while (err && isModelOverloaded(err)) {
           const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
-          if (alt) {
-            ui.setLabel(`${job.model} 忙線中，改用 ${alt} 重試…`);
-            job.model = alt;
-            await persistJob(job);
-            paintJob();
-            try {
-              c.segments = await run();
-              err = null;
-            } catch (e2) {
-              if (isAborted()) throw e2;
-              err = e2;
-            }
+          if (!alt) break; // 整條清單都忙 → 交給下面的 Groq 備援
+          ui.setLabel(`${job.model} 忙線中，改用 ${alt} 重試…`);
+          job.model = alt;
+          await persistJob(job);
+          paintJob();
+          try {
+            c.segments = await run();
+            err = null;
+          } catch (e2) {
+            if (isAborted()) throw e2;
+            err = e2;
           }
         }
         // 第二層補救：額度見底、所有型號都忙、或內容被安全過濾器擋（PROHIBITED_CONTENT）

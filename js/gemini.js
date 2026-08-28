@@ -94,13 +94,39 @@ export function clearModelCache() {
   for (const k in modelCache) delete modelCache[k];
   for (const k in modelListCache) delete modelListCache[k];
 }
+
+// 模型忙線記憶：503 是「這個模型現在扛不住」，跟金鑰無關。
+// 記住 10 分鐘，期間所有選模型的地方都自動跳過它——
+// 否則每一段、每一個功能都要重新撞一次同一面牆（一次 20 秒起跳）。
+const modelBusyUntil = new Map();
+const MODEL_BUSY_MS = 10 * 60 * 1000;
+export function markModelBusy(model, ms = MODEL_BUSY_MS) {
+  if (model) modelBusyUntil.set(model, Date.now() + ms);
+}
+export function isModelBusy(model) {
+  const t = modelBusyUntil.get(model);
+  if (!t) return false;
+  if (Date.now() > t) {
+    modelBusyUntil.delete(model);
+    return false;
+  }
+  return true;
+}
+export function clearModelBusy() {
+  modelBusyUntil.clear();
+}
+// 全部都在忙時退回第一名：用忙的模型碰運氣，也比直接沒有模型可用好
+const pickNonBusy = (list) => list.find((m) => !isModelBusy(m)) || list[0];
 // apiKeys 可為單把字串或多把陣列 → 多把時逐把嘗試查型號（某把冷卻/失敗會換下一把）
 // opts.preferLite: 明確指定要不要用 Flash-Lite（辨識用全域設定；摘要/翻譯固定 false 品質優先）
 async function resolveModel(apiKeys, opts = {}) {
   throwIfAborted();
   const lite = opts.preferLite != null ? opts.preferLite : preferLite;
   const ck = String(lite);
-  if (modelCache[ck]) return modelCache[ck];
+  if (modelCache[ck]) {
+    const list = modelListCache[ck] && modelListCache[ck].length ? modelListCache[ck] : [modelCache[ck]];
+    return pickNonBusy(list);
+  }
   const keys = (Array.isArray(apiKeys) ? apiKeys : [apiKeys]).filter(Boolean);
   if (!keys.length) throw new Error('尚未設定 API 金鑰');
   let lastErr = null;
@@ -122,7 +148,7 @@ async function resolveModel(apiKeys, opts = {}) {
     if (name) {
       modelListCache[ck] = ranked;
       modelCache[ck] = name;
-      return name;
+      return pickNonBusy(ranked);
     }
     lastErr = new Error('這組金鑰找不到可用型號，請確認金鑰是否正確、或是否已啟用 Gemini API。');
   }
@@ -432,6 +458,15 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
       throw new Error(`${act}失敗 (${effStatus})：${lastText.slice(0, 300)}`);
     }
     if (!sawTransient || round >= MAX_ROUNDS) break;
+    // 503 忙線：換金鑰無效（每把打的都是同一個模型），打滿五輪只是空等。
+    // 標記這個模型 10 分鐘內忙線（所有選模型的地方會自動跳過它），第 2 輪就放棄，
+    // 把「換模型」的決定交還給上層。
+    const 這輪忙線 = lastStatus === 503 || /UNAVAILABLE|high demand|overloaded/i.test(lastText || '');
+    if (這輪忙線) {
+      const m = /models\/([^:?/]+)/.exec((makeReq(vs[0]) || {}).url || '');
+      if (m) markModelBusy(m[1]);
+      if (round >= 1) break;
+    }
     // 【2026-08-24】純文字請求不要等——第一輪全部金鑰都受限就直接轉 Groq。
     //
     // 舊版把 Groq 備援放在迴圈**跑完之後**（最多 5 輪／累計 2.5 分鐘）。對「帶音檔」
@@ -812,7 +847,10 @@ export async function nextModelForKeys(apiKeys, current, opts = {}) {
   }
   const list = modelListCache[ck] || [];
   const i = list.indexOf(current);
-  return i >= 0 && i + 1 < list.length ? list[i + 1] : null;
+  if (i < 0) return null;
+  // 往清單下方找第一個「不在忙線中」的：3.6 也忙就再往下（3.6-lite、2.5…）
+  for (let j = i + 1; j < list.length; j++) if (!isModelBusy(list[j])) return list[j];
+  return null;
 }
 
 // 429 收場（所有金鑰輪完、等待也等完仍失敗）：這是「Gemini 額度暫時見底」。
