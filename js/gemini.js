@@ -146,8 +146,47 @@ function applyLock(list) {
   if (!lock || !list.includes(lock)) return list;
   return [lock, ...list.filter((x) => x !== lock)];
 }
-// 全部都在忙時退回第一名：用忙的模型碰運氣，也比直接沒有模型可用好
-const pickNonBusy = (list) => list.find((m) => !isModelBusy(m)) || list[0];
+// 不支援 JSON 模式的型號：這是永久的能力限制（不像忙線會恢復），
+// 記進 localStorage 永久排除，並且要「真的排除」——連退而求其次都不能挑它，
+// 因為挑了必定 400，不是碰運氣的問題。
+const UNSUP_LS = 'model_unsupported';
+function loadUnsup() {
+  try {
+    const a = JSON.parse(localStorage.getItem(UNSUP_LS));
+    return new Set(Array.isArray(a) ? a : []);
+  } catch (_) {
+    return new Set();
+  }
+}
+const unsupported = loadUnsup();
+export function markModelUnsupported(model) {
+  if (!model) return;
+  unsupported.add(model);
+  try {
+    localStorage.setItem(UNSUP_LS, JSON.stringify([...unsupported]));
+  } catch (_) {}
+}
+export function isModelUnsupported(model) {
+  return unsupported.has(model);
+}
+export function clearModelUnsupported() {
+  unsupported.clear();
+  try {
+    localStorage.removeItem(UNSUP_LS);
+  } catch (_) {}
+}
+// 錯誤是否為「型號不支援 JSON 模式」——上層據此換型號重試
+export function isUnsupportedModelError(e) {
+  return !!(e && (e.modelUnsupported || /不支援結構化輸出/.test(e.message || '')));
+}
+
+// 選型號：先剔除確定不能用的，再避開忙線的。
+// 全部都在忙時退回第一名（忙線會恢復，值得碰運氣）；但不支援的永遠不選。
+const pickNonBusy = (list) => {
+  const usable = list.filter((m) => !isModelUnsupported(m));
+  const pool = usable.length ? usable : list;
+  return pool.find((m) => !isModelBusy(m)) || pool[0];
+};
 // apiKeys 可為單把字串或多把陣列 → 多把時逐把嘗試查型號（某把冷卻/失敗會換下一把）
 // opts.preferLite: 明確指定要不要用 Flash-Lite（辨識用全域設定；摘要/翻譯固定 false 品質優先）
 async function resolveModel(apiKeys, opts = {}) {
@@ -477,6 +516,20 @@ async function postJsonRotating(variants, makeReq, onProgress, label) {
         continue;
       }
       if (effStatus === 400) {
+        // 型號不支援 JSON 模式（結構化輸出）。這個 App 每個功能都靠它解析結果，
+        // 沒有它就不能用——但這是「型號能力」問題，不是音檔壞掉。
+        // 舊版一律報成「檔案格式不支援或已損毀」，把使用者指向完全錯誤的方向。
+        if (/JSON mode is not enabled|response_?mime_?type|responseSchema|response_schema/i.test(lastText)) {
+          const bad = (/models\/([^:?/]+)/.exec(url) || [])[1] || '';
+          markModelUnsupported(bad);
+          const e = new Error(
+            `${act}失敗：型號 ${bad || '（不明）'} 不支援結構化輸出（JSON mode），這個 App 的每個功能都需要它。` +
+              `已把它從候選名單移除，換一個型號重試即可；若你在設定指定了型號，請改回「自動」或換一個。`
+          );
+          e.modelUnsupported = true;
+          e.model = bad;
+          throw e;
+        }
         // 「換一個音檔」只在請求真的帶了音檔時才是有效建議；
         // 摘要／加強／翻譯／問答都是純文字，講音檔只會誤導（使用者會以為它又去讀錄音）。
         const hasAudio = /file_data|fileData/.test(body);
@@ -885,7 +938,9 @@ export async function nextModelForKeys(apiKeys, current, opts = {}) {
   const i = list.indexOf(current);
   if (i < 0) return null;
   // 往清單下方找第一個「不在忙線中」的：3.6 也忙就再往下（3.6-lite、2.5…）
-  for (let j = i + 1; j < list.length; j++) if (!isModelBusy(list[j])) return list[j];
+  for (let j = i + 1; j < list.length; j++) if (!isModelBusy(list[j]) && !isModelUnsupported(list[j])) return list[j];
+  // 全都忙線時，退而求其次挑「不忙但先前不支援」以外的任一個尚未試過的
+  for (let j = i + 1; j < list.length; j++) if (!isModelUnsupported(list[j])) return list[j];
   return null;
 }
 
@@ -966,7 +1021,7 @@ export async function getModelChoices(apiKeys) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) return [];
   await resolveModel(kos.map((k) => k.key), { preferLite: false });
-  return (modelListCache['false'] || []).map((m) => ({ name: m, busy: isModelBusy(m) }));
+  return (modelListCache['false'] || []).map((m) => ({ name: m, busy: isModelBusy(m), unsupported: isModelUnsupported(m) }));
 }
 
 // 503／UNAVAILABLE：這是「這個型號現在忙不過來」，不是金鑰或音檔的問題。

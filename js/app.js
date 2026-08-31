@@ -1,7 +1,7 @@
 import { getApiKeys, getApiKeyEntries, setApiKeyEntries, hasApiKey, getModelPref, setModelPref, getModelLock, setModelLock } from './settings.js';
 import { getKeyStatus } from './usage.js';
 import { list, get, save, remove, exportAll, getTombstones, getTombstoneTimes, applyMerged, saveJob, getActiveJob, clearJob } from './store.js';
-import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, ABORT_MSG, getModelChoices, isModelBusy } from './gemini.js';
+import { uploadForJob, transcribeRange, summarize, pickModelForKeys, uploadBlobToKeys, canUseWholeMode, setPreferLite, enhanceSection, translateMeeting, askMeeting, extractTerms, generateNotes, enhanceNotesSection, requestAbort, clearAbort, isAborted, missingKeyEntries, nextModelForKeys, isModelOverloaded, isQuotaStall, isContentBlocked, convertToTraditional, ABORT_MSG, getModelChoices, isModelBusy, isModelUnsupported, isUnsupportedModelError } from './gemini.js';
 import * as wakeLock from './wakelock.js';
 import { getGroups, setGroups, getGroupTombstones, setGroupTombstones, getGroupTombstoneTimes, setGroupTombstoneTimes, addGroup, renameGroup, removeGroup, groupName, groupColor } from './groups.js';
 import { splitAudioToChunks } from './audio.js';
@@ -13,7 +13,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v96';
+const APP_VERSION = 'v97';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -1060,6 +1060,24 @@ async function processJob(job) {
         // （postJsonRotating 撞到 503 時已標記 10 分鐘忙線）。
         // 換金鑰救不了——每把金鑰打的都是同一個型號。
         let err = e;
+        // 型號不支援 JSON 模式：換型號重試（該型號已被永久排除，不會再被挑到）。
+        // 使用者若在設定指定了這個型號，一併解除，否則每次都會選回它。
+        while (err && isUnsupportedModelError(err)) {
+          if (getModelLock() && isModelUnsupported(getModelLock())) setModelLock('');
+          const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
+          if (!alt) break;
+          ui.setLabel(`${job.model} 不支援結構化輸出，改用 ${alt} 重試…`);
+          job.model = alt;
+          await persistJob(job);
+          paintJob();
+          try {
+            c.segments = await run();
+            err = null;
+          } catch (e2) {
+            if (isAborted()) throw e2;
+            err = e2;
+          }
+        }
         while (err && isModelOverloaded(err)) {
           const alt = await nextModelForKeys(getApiKeyEntries(), job.model);
           if (!alt) break; // 整條清單都忙 → 交給下面的 Groq 備援
@@ -2567,7 +2585,7 @@ function renderSettings() {
           for (const c of choices) {
             const opt = document.createElement('option');
             opt.value = c.name;
-            opt.textContent = c.name + (c.busy ? '（忙線中）' : '');
+            opt.textContent = c.name + (c.unsupported ? '（不支援，勿選）' : c.busy ? '（忙線中）' : '');
             lockSel.appendChild(opt);
           }
           lockSel.value = getModelLock() || '';
