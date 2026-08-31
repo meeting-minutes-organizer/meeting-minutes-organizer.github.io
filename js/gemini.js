@@ -54,7 +54,11 @@ function isAbortError(e) {
 // 需要在首選忙線時退而求其次，就用整份排名。
 export function rankModels(models, opts = {}) {
   const lite = opts.preferLite != null ? opts.preferLite : preferLite;
-  const bad = /embedding|aqa|imagen|image|veo|tts|audio-native|gemma|learnlm|robotics|computer-use|live/i;
+  // 排除「不是通用文字模型」的型號。這個 App 每個功能都要求結構化輸出（JSON mode），
+  // 專用型號（語音轉錄、語音合成、圖片、嵌入…）一律不支援，選了必定 400。
+  // transcribe/speech/dialog/native-audio 是 2026 年新增的專用型號家族——
+  // 使用者在下拉選單選到 transcribe 型號而整場失敗，就是漏掉它們造成的。
+  const bad = /embedding|aqa|imagen|image|veo|tts|audio-native|native-audio|transcribe|speech|dialog|realtime|gemma|learnlm|robotics|computer-use|live/i;
   const scored = (models || [])
     .map((m) => {
       const name = String(m.name || '').replace(/^models\//, '');
@@ -1021,7 +1025,10 @@ export async function getModelChoices(apiKeys) {
   const kos = toKeyObjs(apiKeys);
   if (!kos.length) return [];
   await resolveModel(kos.map((k) => k.key), { preferLite: false });
-  return (modelListCache['false'] || []).map((m) => ({ name: m, busy: isModelBusy(m), unsupported: isModelUnsupported(m) }));
+  // 已知不支援的直接不列出來——標成「勿選」還是會被選到，不如不給選。
+  return (modelListCache['false'] || [])
+    .filter((m) => !isModelUnsupported(m))
+    .map((m) => ({ name: m, busy: isModelBusy(m) }));
 }
 
 // 503／UNAVAILABLE：這是「這個型號現在忙不過來」，不是金鑰或音檔的問題。

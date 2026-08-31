@@ -13,7 +13,7 @@ import { exportPdf, exportWord, splitQA } from './export.js';
 import * as sync from './sync.js';
 import { mergeState } from './sync.js';
 
-const APP_VERSION = 'v97';
+const APP_VERSION = 'v98';
 
 // 套用辨識模型偏好（省額度模式 → Flash-Lite）
 setPreferLite(getModelPref() === 'lite');
@@ -2585,8 +2585,15 @@ function renderSettings() {
           for (const c of choices) {
             const opt = document.createElement('option');
             opt.value = c.name;
-            opt.textContent = c.name + (c.unsupported ? '（不支援，勿選）' : c.busy ? '（忙線中）' : '');
+            opt.textContent = c.name + (c.busy ? '（忙線中）' : '');
             lockSel.appendChild(opt);
+          }
+          // 先前鎖定的型號已被排除（專用型號或撞過不支援）→ 自動改回自動，
+          // 否則畫面顯示一個選單裡不存在的值，使用者也不知道它已失效。
+          const lock = getModelLock();
+          if (lock && !choices.some((c) => c.name === lock)) {
+            setModelLock('');
+            toast(`型號 ${lock} 不適用，已改回自動選擇`);
           }
           lockSel.value = getModelLock() || '';
         })
